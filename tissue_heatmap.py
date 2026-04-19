@@ -24,11 +24,16 @@ from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QPolygonF
 from PyQt6.QtCore import QPointF
 
 try:
-    from buhlmann import TISSUES, P_SURF, WATER_DENSITY
+    from buhlmann import TISSUES, P_SURF, WATER_DENSITY, PH2O
 except ImportError:
     P_SURF        = 1.013
     WATER_DENSITY = 1.025
     TISSUES       = []
+    PH2O          = 0.0627
+
+# Surface-equilibrium N2 partial pressure (all tissues pre-dive)
+_PN2_SURF = (P_SURF - PH2O) * 0.7902
+_SURFACE_SNAP = [(_PN2_SURF, 0.0)] * 16
 
 # N2 half-times for compartment labels (ZHL-16C)
 _N2_HT = [4, 8, 12.5, 18.5, 27, 38.3, 54.3, 77, 109, 146, 187, 239, 305, 390, 498, 635]
@@ -1667,6 +1672,9 @@ class _BarWidget(QWidget):
         self._timer.timeout.connect(self._advance)
 
     def _precompute(self, tl):
+        # Prepend synthetic t=0, depth=0 surface-equilibrium frame
+        if tl and (tl[0][0] > 0.0 or tl[0][1] > 0.0):
+            tl = [(0.0, 0.0, _SURFACE_SNAP)] + list(tl)
         self._times  = [e[0] for e in tl]
         self._depths = [e[1] for e in tl]
         if self._surface_mv:
@@ -1732,20 +1740,44 @@ class _BarWidget(QWidget):
             p.drawText(W - self.PAD_R - 70, self.PAD_T - 12, 70, 12,
                        Qt.AlignmentFlag.AlignRight, f"scale: {scale*100:.0f}%")
         else:
-            # Depth mode: normalised (0%=P_amb, 100%=M-value), fixed scale 0–120%
-            scale = 1.2
+            # Depth mode: centred on 0% (P_amb)
+            # Right side: fixed scale 0–120% (positive = off-gassing)
+            # Left side:  dynamic scale based on most negative value
+            scale_r = 1.2
+            min_frac = min(fracs) if fracs else 0.0
+            scale_l  = max(0.2, abs(min_frac) * 1.15) if min_frac < 0 else 0.2
 
-            # M-value line at 100%
-            mv_x = self.PAD_L + int(1.0 / scale * gw)
+            # Allocate pixel widths: left proportional to scale_l, right to scale_r
+            total_scale = scale_l + scale_r
+            left_gw  = int(gw * scale_l / total_scale)
+            right_gw = gw - left_gw
+            zero_x   = self.PAD_L + left_gw   # x-position of 0% line
+
+            # 0% centre line
+            p.setPen(QPen(QColor(180, 180, 180), 1, Qt.PenStyle.SolidLine))
+            p.drawLine(zero_x, self.PAD_T, zero_x, self.PAD_T + gh)
+            p.setPen(QColor(180, 180, 180))
+            p.setFont(QFont("Arial", 7))
+            p.drawText(zero_x - 14, self.PAD_T - 12, 28, 12,
+                       Qt.AlignmentFlag.AlignCenter, "0%")
+
+            # Left scale label (dynamic)
+            p.setPen(QColor(100, 120, 160))
+            p.setFont(QFont("Arial", 7))
+            p.drawText(self.PAD_L, self.PAD_T - 12, left_gw, 12,
+                       Qt.AlignmentFlag.AlignLeft, f"−{scale_l*100:.0f}%")
+
+            # M-value line at 100% on right
+            mv_x = zero_x + int(1.0 / scale_r * right_gw)
             p.setPen(QPen(QColor(220, 60, 60), 2, Qt.PenStyle.DashLine))
             p.drawLine(mv_x, self.PAD_T, mv_x, self.PAD_T + gh)
             p.setPen(QColor(220, 60, 60))
             p.setFont(QFont("Arial", 7))
             p.drawText(mv_x - 20, self.PAD_T - 12, 40, 12,
-                       Qt.AlignmentFlag.AlignCenter, "M-value")
+                       Qt.AlignmentFlag.AlignCenter, "M-val")
 
             # GF High line
-            gfh_x = self.PAD_L + int(self._gf_high / scale * gw)
+            gfh_x = zero_x + int(self._gf_high / scale_r * right_gw)
             p.setPen(QPen(QColor(255, 140, 0), 1, Qt.PenStyle.DashLine))
             p.drawLine(gfh_x, self.PAD_T, gfh_x, self.PAD_T + gh)
             p.setPen(QColor(255, 160, 40))
@@ -1754,7 +1786,7 @@ class _BarWidget(QWidget):
                        Qt.AlignmentFlag.AlignCenter, f"GFh {int(self._gf_high*100)}%")
 
             # GF Low line
-            gfl_x = self.PAD_L + int(self._gf_low / scale * gw)
+            gfl_x = zero_x + int(self._gf_low / scale_r * right_gw)
             p.setPen(QPen(QColor(100, 200, 100), 1, Qt.PenStyle.DashLine))
             p.drawLine(gfl_x, self.PAD_T, gfl_x, self.PAD_T + gh)
             p.setPen(QColor(120, 210, 120))
@@ -1762,7 +1794,7 @@ class _BarWidget(QWidget):
             p.drawText(gfl_x - 18, self.PAD_T - 12, 36, 12,
                        Qt.AlignmentFlag.AlignCenter, f"GFl {int(self._gf_low*100)}%")
 
-            # Dynamic current-GF line (interpolated between GF_low and GF_high)
+            # Dynamic current-GF line
             if self._first_stop_depth > 0:
                 cur_gf = (self._gf_high
                           + (self._gf_low - self._gf_high)
@@ -1770,35 +1802,44 @@ class _BarWidget(QWidget):
                 cur_gf = max(self._gf_low, min(self._gf_high, cur_gf))
             else:
                 cur_gf = self._gf_high
-            cgf_x = self.PAD_L + int(cur_gf / scale * gw)
+            cgf_x = zero_x + int(cur_gf / scale_r * right_gw)
             p.setPen(QPen(QColor(0, 220, 255), 2, Qt.PenStyle.SolidLine))
             p.drawLine(cgf_x, self.PAD_T, cgf_x, self.PAD_T + gh)
             p.setPen(QColor(0, 220, 255))
             p.setFont(QFont("Arial", 7, QFont.Weight.Bold))
             p.drawText(cgf_x - 22, self.PAD_T - 12, 44, 12,
-                       Qt.AlignmentFlag.AlignCenter,
-                       f"GF {cur_gf*100:.0f}%")
-
-            p.setPen(QColor(120, 120, 140))
-            p.setFont(QFont("Arial", 7))
-            p.drawText(W - self.PAD_R - 120, self.PAD_T - 12, 120, 12,
-                       Qt.AlignmentFlag.AlignRight, "0% = P_amb  |  100% = M-val")
+                       Qt.AlignmentFlag.AlignCenter, f"GF {cur_gf*100:.0f}%")
 
         for i in range(16):
             fv = fracs[i] if i < len(fracs) else 0.0
-            bar_w = max(0, int(fv / scale * gw))
-            y     = self.PAD_T + i * (bar_h + 3)
+            y  = self.PAD_T + i * (bar_h + 3)
 
-            p.fillRect(self.PAD_L, y, gw, bar_h, QColor(35, 40, 50))
-            if bar_w > 0:
-                p.fillRect(self.PAD_L, y, bar_w, bar_h, _frac_color_new(fv))
+            if self._surface_mv:
+                p.fillRect(self.PAD_L, y, gw, bar_h, QColor(35, 40, 50))
+                bar_w = max(0, int(fv / scale * gw))
+                if bar_w > 0:
+                    p.fillRect(self.PAD_L, y, bar_w, bar_h, _frac_color_new(fv))
+                label_x = self.PAD_L + bar_w + 4
+            else:
+                p.fillRect(self.PAD_L, y, gw, bar_h, QColor(35, 40, 50))
+                if fv >= 0:
+                    bar_w = min(int(fv / scale_r * right_gw), right_gw)
+                    if bar_w > 0:
+                        p.fillRect(zero_x, y, bar_w, bar_h, _frac_color_new(fv))
+                    label_x = zero_x + bar_w + 2
+                else:
+                    bar_w = min(int(abs(fv) / scale_l * left_gw), left_gw)
+                    if bar_w > 0:
+                        p.fillRect(zero_x - bar_w, y, bar_w, bar_h,
+                                   QColor(60, 100, 180))  # blue for on-gassing
+                    label_x = zero_x - bar_w - 38
 
             p.setPen(QColor(200, 200, 200))
             p.setFont(QFont("Arial", 7))
             p.drawText(2, y, self.PAD_L - 4, bar_h,
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                        f"C{i+1}")
-            p.drawText(self.PAD_L + bar_w + 4, y, 40, bar_h,
+            p.drawText(label_x, y, 38, bar_h,
                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                        f"{fv*100:.0f}%")
 
