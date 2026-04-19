@@ -578,44 +578,32 @@ class DivePlannerTab(QWidget):
         ccr_ts_l.setContentsMargins(6, 8, 6, 6)
         ccr_ts_l.setSpacing(4)
 
-        surf_box = QGroupBox("Surface Saturation")
+        _TAB_NAMES = ["Saturation heatmap", "Leading compartment", "Bar chart (animated)"]
+
+        surf_box = QGroupBox("Surface M-value")
         surf_box.setStyleSheet("QGroupBox { color: #4488cc; }")
         surf_l = QHBoxLayout(surf_box)
         surf_l.setContentsMargins(4, 8, 4, 4)
         surf_l.setSpacing(4)
-        b_hm_ccr_s = QPushButton("Tissue Heatmap")
-        b_hm_ccr_s.setStyleSheet("background:#556688; color:white; font-weight:bold; padding:3px 8px;")
-        b_hm_ccr_s.clicked.connect(lambda: self._open_tissue_window(surface_mv=True, bailout=False))
-        b_pb_ccr_s = QPushButton("Tissue Playback")
-        b_pb_ccr_s.setStyleSheet("background:#885500; color:white; font-weight:bold; padding:3px 8px;")
-        b_pb_ccr_s.clicked.connect(lambda: QMessageBox.information(self, "Info", "Tissue Playback not yet implemented."))
-        sep1 = QFrame(); sep1.setFrameShape(QFrame.Shape.VLine)
-        sep1.setStyleSheet("color:#334466;"); sep1.setFixedWidth(2)
-        self._integ_ccr_surf_lbl = QLabel("—")
-        self._integ_ccr_surf_lbl.setStyleSheet("font-weight:bold; color:#44ccff;")
-        surf_l.addWidget(b_hm_ccr_s); surf_l.addWidget(b_pb_ccr_s)
-        surf_l.addWidget(sep1); surf_l.addWidget(QLabel("∫ sat ="))
-        surf_l.addWidget(self._integ_ccr_surf_lbl); surf_l.addStretch()
+        for _ti, _tn in enumerate(_TAB_NAMES):
+            _btn = QPushButton(_tn)
+            _btn.setStyleSheet("background:#556688; color:white; font-weight:bold; padding:3px 8px;")
+            _btn.clicked.connect(lambda _chk=False, _t=_ti: self._open_tissue_window(surface_mv=True, bailout=False, tab=_t))
+            surf_l.addWidget(_btn)
+        surf_l.addStretch()
         ccr_ts_l.addWidget(surf_box)
 
-        dep_box = QGroupBox("Depth Saturation")
+        dep_box = QGroupBox("Depth M-value")
         dep_box.setStyleSheet("QGroupBox { color: #226644; }")
         dep_l = QHBoxLayout(dep_box)
         dep_l.setContentsMargins(4, 8, 4, 4)
         dep_l.setSpacing(4)
-        b_hm_ccr_d = QPushButton("Tissue Heatmap")
-        b_hm_ccr_d.setStyleSheet("background:#3d6655; color:white; font-weight:bold; padding:3px 8px;")
-        b_hm_ccr_d.clicked.connect(lambda: self._open_tissue_window(surface_mv=False, bailout=False))
-        b_pb_ccr_d = QPushButton("Tissue Playback")
-        b_pb_ccr_d.setStyleSheet("background:#5a5500; color:white; font-weight:bold; padding:3px 8px;")
-        b_pb_ccr_d.clicked.connect(lambda: QMessageBox.information(self, "Info", "Tissue Playback not yet implemented."))
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.VLine)
-        sep2.setStyleSheet("color:#224433;"); sep2.setFixedWidth(2)
-        self._integ_ccr_dep_lbl = QLabel("—")
-        self._integ_ccr_dep_lbl.setStyleSheet("font-weight:bold; color:#44cc88;")
-        dep_l.addWidget(b_hm_ccr_d); dep_l.addWidget(b_pb_ccr_d)
-        dep_l.addWidget(sep2); dep_l.addWidget(QLabel("∫ sat ="))
-        dep_l.addWidget(self._integ_ccr_dep_lbl); dep_l.addStretch()
+        for _ti, _tn in enumerate(_TAB_NAMES):
+            _btn = QPushButton(_tn)
+            _btn.setStyleSheet("background:#3d6655; color:white; font-weight:bold; padding:3px 8px;")
+            _btn.clicked.connect(lambda _chk=False, _t=_ti: self._open_tissue_window(surface_mv=False, bailout=False, tab=_t))
+            dep_l.addWidget(_btn)
+        dep_l.addStretch()
         ccr_ts_l.addWidget(dep_box)
 
         gf_box = QGroupBox("GF Comparison")
@@ -638,37 +626,31 @@ class DivePlannerTab(QWidget):
         bail_ts_l.setContentsMargins(6, 8, 6, 6)
         bail_ts_l.setSpacing(4)
 
-        bail_surf_box = QGroupBox("Surface Saturation")
+        _TAB_NAMES = ["Saturation heatmap", "Leading compartment", "Bar chart (animated)"]
+
+        bail_surf_box = QGroupBox("Surface M-value")
         bail_surf_box.setStyleSheet("QGroupBox { color: #4488cc; }")
         bail_surf_l = QHBoxLayout(bail_surf_box)
         bail_surf_l.setContentsMargins(4, 8, 4, 4)
         bail_surf_l.setSpacing(4)
-        b_hm_bail_s = QPushButton("Tissue Heatmap")
-        b_hm_bail_s.setStyleSheet("background:#556688; color:white; font-weight:bold; padding:3px 8px;")
-        b_hm_bail_s.clicked.connect(lambda: self._open_tissue_window(surface_mv=True, bailout=True))
-        sep3 = QFrame(); sep3.setFrameShape(QFrame.Shape.VLine)
-        sep3.setStyleSheet("color:#334466;"); sep3.setFixedWidth(2)
-        self._integ_bail_surf_lbl = QLabel("—")
-        self._integ_bail_surf_lbl.setStyleSheet("font-weight:bold; color:#44ccff;")
-        bail_surf_l.addWidget(b_hm_bail_s); bail_surf_l.addWidget(sep3)
-        bail_surf_l.addWidget(QLabel("∫ sat =")); bail_surf_l.addWidget(self._integ_bail_surf_lbl)
+        for _ti, _tn in enumerate(_TAB_NAMES):
+            _btn = QPushButton(_tn)
+            _btn.setStyleSheet("background:#556688; color:white; font-weight:bold; padding:3px 8px;")
+            _btn.clicked.connect(lambda _chk=False, _t=_ti: self._open_tissue_window(surface_mv=True, bailout=True, tab=_t))
+            bail_surf_l.addWidget(_btn)
         bail_surf_l.addStretch()
         bail_ts_l.addWidget(bail_surf_box)
 
-        bail_dep_box = QGroupBox("Depth Saturation")
+        bail_dep_box = QGroupBox("Depth M-value")
         bail_dep_box.setStyleSheet("QGroupBox { color: #226644; }")
         bail_dep_l = QHBoxLayout(bail_dep_box)
         bail_dep_l.setContentsMargins(4, 8, 4, 4)
         bail_dep_l.setSpacing(4)
-        b_hm_bail_d = QPushButton("Tissue Heatmap")
-        b_hm_bail_d.setStyleSheet("background:#3d6655; color:white; font-weight:bold; padding:3px 8px;")
-        b_hm_bail_d.clicked.connect(lambda: self._open_tissue_window(surface_mv=False, bailout=True))
-        sep4 = QFrame(); sep4.setFrameShape(QFrame.Shape.VLine)
-        sep4.setStyleSheet("color:#224433;"); sep4.setFixedWidth(2)
-        self._integ_bail_dep_lbl = QLabel("—")
-        self._integ_bail_dep_lbl.setStyleSheet("font-weight:bold; color:#44cc88;")
-        bail_dep_l.addWidget(b_hm_bail_d); bail_dep_l.addWidget(sep4)
-        bail_dep_l.addWidget(QLabel("∫ sat =")); bail_dep_l.addWidget(self._integ_bail_dep_lbl)
+        for _ti, _tn in enumerate(_TAB_NAMES):
+            _btn = QPushButton(_tn)
+            _btn.setStyleSheet("background:#3d6655; color:white; font-weight:bold; padding:3px 8px;")
+            _btn.clicked.connect(lambda _chk=False, _t=_ti: self._open_tissue_window(surface_mv=False, bailout=True, tab=_t))
+            bail_dep_l.addWidget(_btn)
         bail_dep_l.addStretch()
         bail_ts_l.addWidget(bail_dep_box)
 
@@ -2008,34 +1990,6 @@ class DivePlannerTab(QWidget):
             out.append((pt, a + p_amb / b))
         return out
 
-    @staticmethod
-    def _compute_sat_integral(timeline, surface_mv=True):
-        """Mitchell/Doolette integrated saturation metric."""
-        if not timeline or len(timeline) < 2:
-            return None
-        total = 0.0
-        for idx, (rt, depth, snap, *_) in enumerate(timeline):
-            dt_prev = (rt - timeline[idx-1][0]) / 2 if idx > 0 else 0.0
-            dt_next = (timeline[idx+1][0] - rt) / 2 if idx < len(timeline)-1 else 0.0
-            dt = dt_prev + dt_next
-            mv_list = DivePlannerTab._snap_mv(snap, depth, surface=surface_mv)
-            compartment_sum = sum(pt / mv for pt, mv in mv_list if mv > 0)
-            total += compartment_sum * dt
-        return total
-
-    def _update_integrals(self):
-        """Compute and display ∫ saturation values."""
-        def _fmt(val):
-            return f"{val:.0f}" if val is not None else "—"
-        ccr_surf  = self._compute_sat_integral(self._tissue_timeline,      surface_mv=True)
-        ccr_dep   = self._compute_sat_integral(self._tissue_timeline,      surface_mv=False)
-        bail_surf = self._compute_sat_integral(self._bail_tissue_timeline, surface_mv=True)
-        bail_dep  = self._compute_sat_integral(self._bail_tissue_timeline, surface_mv=False)
-        self._integ_ccr_surf_lbl.setText(_fmt(ccr_surf))
-        self._integ_ccr_dep_lbl.setText(_fmt(ccr_dep))
-        self._integ_bail_surf_lbl.setText(_fmt(bail_surf))
-        self._integ_bail_dep_lbl.setText(_fmt(bail_dep))
-
     # ── Embedded chart updates ────────────────────────────────────────────────
 
     def _update_charts(self, segments=None):
@@ -2235,8 +2189,8 @@ class DivePlannerTab(QWidget):
             sp.set_edgecolor("#2a2a4a")
         self._gas_canvas.draw()
 
-    def _open_tissue_window(self, surface_mv=True, bailout=False):
-        """Open a tissue heatmap popup window."""
+    def _open_tissue_window(self, surface_mv=True, bailout=False, tab=0):
+        """Open a tissue heatmap popup window at the given tab index."""
         timeline = self._bail_tissue_timeline if bailout else self._tissue_timeline
         if not timeline:
             QMessageBox.information(self, "No Data",
@@ -2258,6 +2212,7 @@ class DivePlannerTab(QWidget):
                 first_stop_depth=first_stop,
             )
             win.show()
+            win._tabs.setCurrentIndex(tab)
         except ImportError:
             QMessageBox.information(self, "Info",
                 "Tissue heatmap visualization not yet implemented.")
@@ -2991,8 +2946,6 @@ class DivePlannerTab(QWidget):
         self._render_stops(display_list, self._bail_table_area,
                            extra_data=bail_extra, has_pre_gas=False)
 
-        # Update integrated saturation display
-        self._update_integrals()
         self._update_charts(segments)
 
         # (no autosave — profile is only written on explicit Save / Save as new)

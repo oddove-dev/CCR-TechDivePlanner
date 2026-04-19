@@ -1715,7 +1715,7 @@ class _BarWidget(QWidget):
         p.fillRect(0, 0, W, H, QColor(18, 22, 30))
 
         if self._surface_mv:
-            # Surface mode: dynamic scale, 75%/90%/M-value reference lines
+            # Surface mode: dynamic scale, M-value reference line only
             max_frac = max(fracs) if fracs else 1.2
             scale    = max(1.2, max_frac * 1.08)
 
@@ -1727,13 +1727,6 @@ class _BarWidget(QWidget):
             p.drawText(mv_x - 20, self.PAD_T - 12, 40, 12,
                        Qt.AlignmentFlag.AlignCenter, "M-value")
 
-            for ref, lbl in ((0.75, "75%"), (0.90, "90%")):
-                rx = self.PAD_L + int(ref / scale * gw)
-                p.setPen(QPen(QColor(100, 100, 60), 1, Qt.PenStyle.DashLine))
-                p.drawLine(rx, self.PAD_T, rx, self.PAD_T + gh)
-                p.setPen(QColor(140, 140, 80))
-                p.drawText(rx - 14, self.PAD_T - 12, 28, 12,
-                           Qt.AlignmentFlag.AlignCenter, lbl)
 
             p.setPen(QColor(120, 120, 140))
             p.setFont(QFont("Arial", 7))
@@ -1807,8 +1800,8 @@ class _BarWidget(QWidget):
             p.drawLine(cgf_x, self.PAD_T, cgf_x, self.PAD_T + gh)
             p.setPen(QColor(0, 220, 255))
             p.setFont(QFont("Arial", 7, QFont.Weight.Bold))
-            p.drawText(cgf_x - 22, self.PAD_T - 12, 44, 12,
-                       Qt.AlignmentFlag.AlignCenter, f"GF {cur_gf*100:.0f}%")
+            p.drawText(cgf_x - 22, self.PAD_T - 24, 44, 12,
+                       Qt.AlignmentFlag.AlignCenter, f"GFi {cur_gf*100:.0f}%")
 
         for i in range(16):
             fv = fracs[i] if i < len(fracs) else 0.0
@@ -1883,8 +1876,7 @@ class _BarTab(QWidget):
                 "ANIMATED BAR CHART (Surface M-value) — Each horizontal bar is one tissue compartment "
                 "(C1 top = fastest, C16 bottom = slowest).  Bar length = saturation fraction (pt / Surface M-value).  "
                 "The red dashed line marks 100% of the surface M-value — any bar reaching it means the tissue "
-                "is supersaturated beyond the surface limit.  The yellow 90% and 75% lines are common conservative "
-                "reference thresholds.  Scale adjusts dynamically to always fit the largest bar.  "
+                "is supersaturated beyond the surface limit.  Scale adjusts dynamically to always fit the largest bar.  "
                 "Bar colour: blue = low load, green = moderate, yellow/orange = approaching limit, red/purple = at or over limit.  "
                 "Use ▶ Play to watch how gas loads shift from fast to slow tissues as the dive progresses."
             )
@@ -2824,31 +2816,32 @@ class TissueHeatmapWindow(QWidget):
         note3_bot.setWordWrap(True)
         t3l.addWidget(note3_bot)
 
-        # ── Normalised chart (0% = P_amb, 100% = M-value) ────────────────────
-        _sep3 = QFrame(); _sep3.setFrameShape(QFrame.Shape.HLine)
-        _sep3.setStyleSheet("color:#555;"); t3l.addWidget(_sep3)
+        # ── Normalised chart — only in depth M-val mode ───────────────────────
+        if not surface_mv:
+            _sep3 = QFrame(); _sep3.setFrameShape(QFrame.Shape.HLine)
+            _sep3.setStyleSheet("color:#555;"); t3l.addWidget(_sep3)
 
-        _lead_norm = _LeadingNormWidget(timeline, surface_mv, stops=stops,
-                                        gf_low=gf_low, gf_high=gf_high,
-                                        first_stop=_first_stop,
-                                        first_stop_rt=_first_stop_rt)
-        t3l.addWidget(_lead_norm, 1)
-        _gf_apply_norm = self._on_gf_apply if self._resimulate_fn else None
-        t3l.addLayout(_gf_input_bar(_lead_norm, gf_low, gf_high,
-                                    label="GF corridor line:",
-                                    on_apply=_gf_apply_norm))
+            _lead_norm = _LeadingNormWidget(timeline, surface_mv, stops=stops,
+                                            gf_low=gf_low, gf_high=gf_high,
+                                            first_stop=_first_stop,
+                                            first_stop_rt=_first_stop_rt)
+            t3l.addWidget(_lead_norm, 1)
+            _gf_apply_norm = self._on_gf_apply if self._resimulate_fn else None
+            t3l.addLayout(_gf_input_bar(_lead_norm, gf_low, gf_high,
+                                        label="GF corridor line:",
+                                        on_apply=_gf_apply_norm))
 
-        note3_norm = QLabel(
-            "NORMALISED SATURATION — Same leading compartment data rescaled so that "
-            "the ambient pressure (P_amb) sits at 0% and the Bühlmann M-value sits at 100%.  "
-            "On this scale the GF corridor lines fall at exactly GF_low% and GF_high%, "
-            "making it easy to read how close the tissue is to the allowed limit.  "
-            "Negative values = tissue is still loading (below ambient equilibrium).  "
-            "Values above 100% = tissue exceeds M-value (should not happen during a safe dive)."
-        )
-        note3_norm.setStyleSheet("font-size:13px; color:#000;")
-        note3_norm.setWordWrap(True)
-        t3l.addWidget(note3_norm)
+            note3_norm = QLabel(
+                "NORMALISED SATURATION — Same leading compartment data rescaled so that "
+                "the ambient pressure (P_amb) sits at 0% and the Bühlmann M-value sits at 100%.  "
+                "On this scale the GF corridor lines fall at exactly GF_low% and GF_high%, "
+                "making it easy to read how close the tissue is to the allowed limit.  "
+                "Negative values = tissue is still loading (below ambient equilibrium).  "
+                "Values above 100% = tissue exceeds M-value (should not happen during a safe dive)."
+            )
+            note3_norm.setStyleSheet("font-size:13px; color:#000;")
+            note3_norm.setWordWrap(True)
+            t3l.addWidget(note3_norm)
 
         # Explore button
         _explore_btn = QPushButton("🔬  Explore Compartment Calculations…")
