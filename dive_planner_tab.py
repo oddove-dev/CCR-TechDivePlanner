@@ -270,6 +270,7 @@ class DivePlannerTab(QWidget):
         self._calc_timer.timeout.connect(self._recalc_and_run)
         self._saved_stops           = []
         self._bail_stops_data       = []
+        self._bail_saved_stops      = []
         self._tissue_timeline       = []
         self._bail_tissue_timeline  = []
         self._tissue_phase_list     = []
@@ -478,32 +479,40 @@ class DivePlannerTab(QWidget):
 
     # ── Settings panel ────────────────────────────────────────────────────────
 
+    # Settings field definitions (label, attr, default)
+    _SETTINGS_FIELDS = [
+        ("CCR Descend PO2 [bar]",    "_sp_desc",     "0.7"),
+        ("CCR Bottom PO2 [bar]",     "_sp",          "1.3"),
+        ("CCR Deco PO2 [bar]",       "_sp_deco",     "1.6"),
+        ("CCR Deko last stop [m]",   "_last_stop",   "3"),
+        ("GF Low [%]",               "_gf_lo",       "30"),
+        ("GF High [%]",              "_gf_hi",       "80"),
+        ("Descent rate [m/min]",     "_desc_r",      "20"),
+        ("Ascent rate [m/min]",      "_asc_r",       "9"),
+        ("Deco rate [m/min]",        "_deco_r",      "3"),
+        ("SAC rate [L/min]",         "_sac",         "20"),
+        ("Deco switch PO2 BO [bar]", "_deko_sw",     "1.6"),
+        ("Stop interval [m]",        "_stop_int",    "3"),
+        ("Display interval [m]",     "_display_int", "3"),
+        ("Heatmap interval [min]",   "_heatmap_int", "0.1"),
+    ]
+
     def _build_settings(self):
         """Build settings widget (used as a tab). Returns the widget."""
         box = QGroupBox("Settings")
-        box_l = QHBoxLayout(box)
-        box_l.setContentsMargins(6, 8, 6, 6)
+        outer_vl = QVBoxLayout(box)
+        outer_vl.setContentsMargins(6, 8, 6, 6)
+        outer_vl.setSpacing(4)
+
+        fields_w = QWidget()
+        box_l = QHBoxLayout(fields_w)
+        box_l.setContentsMargins(0, 0, 0, 0)
         box_l.setSpacing(8)
 
-        fields = [
-            ("CCR Descend PO2 [bar]",  "_sp_desc",  "0.7"),
-            ("CCR Bottom PO2 [bar]",   "_sp",       "1.3"),
-            ("CCR Deco PO2 [bar]",     "_sp_deco",  "1.6"),
-            ("CCR Deko last stop [m]", "_last_stop", "3"),
-            ("GF Low [%]",             "_gf_lo",    "30"),
-            ("GF High [%]",            "_gf_hi",    "80"),
-            ("Descent rate [m/min]",   "_desc_r",   "20"),
-            ("Ascent rate [m/min]",    "_asc_r",    "9"),
-            ("Deco rate [m/min]",      "_deco_r",   "3"),
-            ("SAC rate [L/min]",       "_sac",      "20"),
-            ("Deco switch PO2 BO [bar]",  "_deko_sw",     "1.6"),
-            ("Stop interval [m]",      "_stop_int",      "3"),
-            ("Display interval [m]",   "_display_int",   "3"),
-            ("Heatmap interval [min]", "_heatmap_int",   "1"),
-        ]
+        fields = self._SETTINGS_FIELDS
         mid = (len(fields) + 1) // 2
 
-        for col_idx, col_fields in enumerate([fields[:mid], fields[mid:]]):
+        for col_fields in [fields[:mid], fields[mid:]]:
             col_w = QWidget()
             col_w.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
             col_l = QGridLayout(col_w)
@@ -523,7 +532,42 @@ class DivePlannerTab(QWidget):
             box_l.addWidget(col_w)
 
         box_l.addStretch()
+        outer_vl.addWidget(fields_w)
+
+        # Save button row
+        btn_row = QHBoxLayout()
+        self._settings_status_lbl = QLabel("")
+        self._settings_status_lbl.setStyleSheet("color:#44cc88; font-size:9px;")
+        save_btn = QPushButton("Save settings")
+        save_btn.setFixedWidth(110)
+        save_btn.setStyleSheet("background:#2a5a2a; color:white; font-weight:bold; padding:3px 8px;")
+        save_btn.clicked.connect(self._save_global_settings)
+        btn_row.addStretch()
+        btn_row.addWidget(self._settings_status_lbl)
+        btn_row.addWidget(save_btn)
+        outer_vl.addLayout(btn_row)
+
         return box
+
+    def _save_global_settings(self):
+        """Save current settings fields to db as global settings."""
+        gs = {}
+        for _, attr, default in self._SETTINGS_FIELDS:
+            le = getattr(self, attr + "_le", None)
+            gs[attr] = le.text() if le else default
+        self._db["global_settings"] = gs
+        from main_qt import save_db
+        save_db(self._db)
+        self._settings_status_lbl.setText("Saved ✓")
+        QTimer.singleShot(2000, lambda: self._settings_status_lbl.setText(""))
+
+    def _load_global_settings(self):
+        """Load global settings from db into settings fields."""
+        gs = self._db.get("global_settings", {})
+        for _, attr, default in self._SETTINGS_FIELDS:
+            le = getattr(self, attr + "_le", None)
+            if le:
+                le.setText(gs.get(attr, default))
 
     # ── CCR Tissue Saturations panel ──────────────────────────────────────────
 
@@ -1662,6 +1706,8 @@ class DivePlannerTab(QWidget):
             bp_plan = self._bp_tab._current_plan()
             if bp_plan and bp_plan != "—":
                 self.sync_plan(bp_plan)
+        # Always restore global settings (profiles must not override them)
+        self._load_global_settings()
 
     def _refresh_stage_plan_cb(self):
         user  = self._bp_tab._current_user()
@@ -1826,24 +1872,7 @@ class DivePlannerTab(QWidget):
 
     def _load_state(self, s: dict):
         self._loading = True
-        # Settings
-        for attr, key, default in [
-            ("_sp",       "setpoint",   "1.3"),
-            ("_sp_desc",  "sp_descend", "0.7"),
-            ("_sp_deco",  "sp_deko",    "1.6"),
-            ("_gf_lo",    "gf_lo",      "30"),
-            ("_gf_hi",    "gf_hi",      "80"),
-            ("_desc_r",   "desc_r",     "20"),
-            ("_asc_r",    "asc_r",      "9"),
-            ("_deco_r",   "deco_r",     "3"),
-            ("_sac",      "sac",        "20"),
-            ("_deko_sw",  "deko_sw_po2","1.6"),
-            ("_stop_int",    "stop_int",    "3"),
-            ("_display_int", "display_int", "3"),
-        ]:
-            le = getattr(self, attr + "_le", None)
-            if le:
-                le.setText(s.get(key, default))
+        # Settings are global — not loaded from profiles
 
         # Segments
         for row in list(self._seg_rows):
@@ -2217,13 +2246,16 @@ class DivePlannerTab(QWidget):
                 ("Surface M-value" if surface_mv else "Depth M-value")
         try:
             from tissue_heatmap import TissueHeatmapWindow
-            stops      = self._saved_stops if not bailout else []
+            stops      = self._bail_saved_stops if bailout else self._saved_stops
             phase_list = self._bail_phase_list if bailout else self._tissue_phase_list
+            first_stop = (self._bail_first_stop_depth if bailout
+                          else self._ccr_first_stop_depth)
             win = TissueHeatmapWindow(
                 self, timeline, surface_mv=surface_mv, title=label,
                 stops=stops, phase_list=phase_list,
                 gf_low=self._last_gf_low, gf_high=self._last_gf_high,
                 resimulate_fn=None if bailout else self.resimulate_with_gf,
+                first_stop_depth=first_stop,
             )
             win.show()
         except ImportError:
@@ -2449,7 +2481,7 @@ class DivePlannerTab(QWidget):
         deco_r = self._get_setting("_deco_r",  3)
 
         # ── CCR simulation ───────────────────────────────────────────────────
-        _snap_iv   = max(0.5, self._get_setting("_heatmap_int", 1.0))
+        _snap_iv   = max(0.1, self._get_setting("_heatmap_int", 1.0))
         _stop_iv   = max(1.0, self._get_setting("_stop_int",    3.0))
         _last_stop = max(0.0, self._get_setting("_last_stop",   3.0))
         result = None
@@ -2623,7 +2655,7 @@ class DivePlannerTab(QWidget):
                     segments=segments, ccr=ccr, oc_gases=oc_gases,
                     gf_low=gf_lo, gf_high=gf_hi,
                     desc_rate=desc_r, asc_rate=asc_r, deco_rate=deco_r,
-                    snap_interval=max(0.5, self._get_setting("_heatmap_int", 1.0)),
+                    snap_interval=max(0.1, self._get_setting("_heatmap_int", 1.0)),
                     stop_interval=max(1.0, self._get_setting("_stop_int", 3.0)),
                 )
                 self._bail_summary_lbl.setText(
@@ -2639,6 +2671,7 @@ class DivePlannerTab(QWidget):
                 self._bail_tissue_timeline  = bail.tissue_timeline
                 self._bail_phase_list       = bail.tissue_phase_list
                 self._bail_first_stop_depth = bail.first_stop_depth
+                self._bail_saved_stops      = bail_stops
                 bail_total_runtime          = bail.runtime
             except Exception as e:
                 self._bail_summary_lbl.setText(f"Error: {e}")
@@ -2849,7 +2882,20 @@ class DivePlannerTab(QWidget):
                 _consume(plan_drop, te, used_L)
                 rest_L     = _consume(plan_base, te, used_L)
                 pres_after = _get_pres(plan_base, te)
-                total_base = _total(plan_base)
+                # Buoyancy after consuming this stop's gas AND transit to next stop/surface
+                import copy as _copy
+                _plan_tmp = _copy.deepcopy(plan_base)
+                if i + 1 < len(bail_stops):
+                    _next_depth = bail_stops[i + 1]["depth"]
+                    _next_gas   = bail_stops[i + 1]["gas"]
+                else:
+                    _next_depth = 0.0
+                    _next_gas   = stop["gas"]
+                _transit_time = max(0.0, (stop["depth"] - _next_depth) / asc_r)
+                _transit_avg  = (stop["depth"] + _next_depth) / 2.0
+                _transit_L    = sac * _transit_time * (_transit_avg / 10.0 + 1.0)
+                _consume(_plan_tmp, _trk(_next_gas), _transit_L)
+                total_base = _total(_plan_tmp)
                 total_drop = _total(plan_drop)
                 drop_col   = (f"{total_drop:+.2f}"
                               if has_drops and total_drop is not None else "—")
@@ -2900,11 +2946,17 @@ class DivePlannerTab(QWidget):
             ]
             if bail_extra is not None:
                 last_bail_extra = bail_extra[-1] if bail_extra else []
-                # Keep column widths; show "—" for PO2/Used, carry over Press/Remain/Buoyancy
-                surface_extra = [
-                    ("—" if i in (0, 2) else v, w, a)
-                    for i, (v, w, a) in enumerate(last_bail_extra)
-                ] if last_bail_extra else []
+                # Compute true end-of-dive buoyancy from fully-consumed plan_base
+                _final_buoy = _total(plan_base) if bail_stops and sac > 0 and plan_state_bp else None
+                _final_buoy_str = (f"{_final_buoy:+.2f}" if _final_buoy is not None else "—")
+                surface_extra = []
+                for _si, (_v, _w, _a) in enumerate(last_bail_extra):
+                    if _si == 0 or _si == 2:
+                        surface_extra.append(("—", _w, _a))
+                    elif _si == 4:
+                        surface_extra.append((_final_buoy_str, _w, _a))
+                    else:
+                        surface_extra.append((_v, _w, _a))
                 bail_extra = list(bail_extra) + [surface_extra]
 
         # Collect gas chart data — always 4 slots matching the 4 bailout gas rows

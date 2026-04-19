@@ -69,6 +69,27 @@ def _sat_fractions(snap: list, depth: float, surface_mv: bool) -> list[float]:
     return fracs
 
 
+def _norm_fractions(snap: list, depth: float) -> list[float]:
+    """Normalised saturation: 0% = P_amb, 100% = depth M-value."""
+    p_amb = _p_amb(depth)
+    fracs = []
+    for i, (p_n2, p_he) in enumerate(snap):
+        if i >= len(TISSUES):
+            fracs.append(0.0)
+            continue
+        _, N2_a, N2_b, _, He_a, He_b = TISSUES[i]
+        pt = p_n2 + p_he
+        if pt > 0:
+            a = (N2_a * p_n2 + He_a * p_he) / pt
+            b = (N2_b * p_n2 + He_b * p_he) / pt
+        else:
+            a, b = N2_a, N2_b
+        mv = a + p_amb / b
+        denom = mv - p_amb
+        fracs.append((pt - p_amb) / denom if denom > 0 else 0.0)
+    return fracs
+
+
 def _mv(i: int, snap_i: tuple, depth: float, surface_mv: bool) -> float:
     """M-value for compartment i given ambient conditions."""
     p_amb = P_SURF if surface_mv else _p_amb(depth)
@@ -1629,9 +1650,14 @@ class _BarWidget(QWidget):
     """Horizontal bar chart — 16 compartments, animated over timeline."""
     PAD_L = 56; PAD_R = 20; PAD_T = 30; PAD_B = 20
 
-    def __init__(self, timeline: list, surface_mv: bool, parent=None):
+    def __init__(self, timeline: list, surface_mv: bool,
+                 gf_low: float = 0.55, gf_high: float = 0.80,
+                 first_stop_depth: float = 0.0, parent=None):
         super().__init__(parent)
-        self._surface_mv = surface_mv
+        self._surface_mv       = surface_mv
+        self._gf_low           = gf_low
+        self._gf_high          = gf_high
+        self._first_stop_depth = first_stop_depth
         self._frame      = 0
         self._playing    = False
         self._precompute(timeline)
@@ -1643,8 +1669,11 @@ class _BarWidget(QWidget):
     def _precompute(self, tl):
         self._times  = [e[0] for e in tl]
         self._depths = [e[1] for e in tl]
-        self._fracs  = [_sat_fractions(e[2], e[1], self._surface_mv) for e in tl]
-        self._n      = len(tl)
+        if self._surface_mv:
+            self._fracs = [_sat_fractions(e[2], e[1], True) for e in tl]
+        else:
+            self._fracs = [_norm_fractions(e[2], e[1]) for e in tl]
+        self._n = len(tl)
 
     def _advance(self):
         self._frame = (self._frame + 1) % self._n
@@ -1677,39 +1706,99 @@ class _BarWidget(QWidget):
 
         p.fillRect(0, 0, W, H, QColor(18, 22, 30))
 
-        # M-value reference line
-        mv_x = self.PAD_L + int(1.0 / 1.2 * gw)
-        p.setPen(QPen(QColor(220, 60, 60), 2, Qt.PenStyle.DashLine))
-        p.drawLine(mv_x, self.PAD_T, mv_x, self.PAD_T + gh)
-        p.setPen(QColor(220, 60, 60))
-        p.setFont(QFont("Arial", 7))
-        p.drawText(mv_x - 20, self.PAD_T - 12, 40, 12,
-                   Qt.AlignmentFlag.AlignCenter, "M-value")
+        if self._surface_mv:
+            # Surface mode: dynamic scale, 75%/90%/M-value reference lines
+            max_frac = max(fracs) if fracs else 1.2
+            scale    = max(1.2, max_frac * 1.08)
 
-        # 75% / 90% reference lines
-        for ref, lbl in ((0.75, "75%"), (0.90, "90%")):
-            rx = self.PAD_L + int(ref / 1.2 * gw)
-            p.setPen(QPen(QColor(100, 100, 60), 1, Qt.PenStyle.DashLine))
-            p.drawLine(rx, self.PAD_T, rx, self.PAD_T + gh)
-            p.setPen(QColor(140, 140, 80))
-            p.drawText(rx - 14, self.PAD_T - 12, 28, 12,
-                       Qt.AlignmentFlag.AlignCenter, lbl)
+            mv_x = self.PAD_L + int(1.0 / scale * gw)
+            p.setPen(QPen(QColor(220, 60, 60), 2, Qt.PenStyle.DashLine))
+            p.drawLine(mv_x, self.PAD_T, mv_x, self.PAD_T + gh)
+            p.setPen(QColor(220, 60, 60))
+            p.setFont(QFont("Arial", 7))
+            p.drawText(mv_x - 20, self.PAD_T - 12, 40, 12,
+                       Qt.AlignmentFlag.AlignCenter, "M-value")
+
+            for ref, lbl in ((0.75, "75%"), (0.90, "90%")):
+                rx = self.PAD_L + int(ref / scale * gw)
+                p.setPen(QPen(QColor(100, 100, 60), 1, Qt.PenStyle.DashLine))
+                p.drawLine(rx, self.PAD_T, rx, self.PAD_T + gh)
+                p.setPen(QColor(140, 140, 80))
+                p.drawText(rx - 14, self.PAD_T - 12, 28, 12,
+                           Qt.AlignmentFlag.AlignCenter, lbl)
+
+            p.setPen(QColor(120, 120, 140))
+            p.setFont(QFont("Arial", 7))
+            p.drawText(W - self.PAD_R - 70, self.PAD_T - 12, 70, 12,
+                       Qt.AlignmentFlag.AlignRight, f"scale: {scale*100:.0f}%")
+        else:
+            # Depth mode: normalised (0%=P_amb, 100%=M-value), fixed scale 0–120%
+            scale = 1.2
+
+            # M-value line at 100%
+            mv_x = self.PAD_L + int(1.0 / scale * gw)
+            p.setPen(QPen(QColor(220, 60, 60), 2, Qt.PenStyle.DashLine))
+            p.drawLine(mv_x, self.PAD_T, mv_x, self.PAD_T + gh)
+            p.setPen(QColor(220, 60, 60))
+            p.setFont(QFont("Arial", 7))
+            p.drawText(mv_x - 20, self.PAD_T - 12, 40, 12,
+                       Qt.AlignmentFlag.AlignCenter, "M-value")
+
+            # GF High line
+            gfh_x = self.PAD_L + int(self._gf_high / scale * gw)
+            p.setPen(QPen(QColor(255, 140, 0), 1, Qt.PenStyle.DashLine))
+            p.drawLine(gfh_x, self.PAD_T, gfh_x, self.PAD_T + gh)
+            p.setPen(QColor(255, 160, 40))
+            p.setFont(QFont("Arial", 7))
+            p.drawText(gfh_x - 18, self.PAD_T - 12, 36, 12,
+                       Qt.AlignmentFlag.AlignCenter, f"GFh {int(self._gf_high*100)}%")
+
+            # GF Low line
+            gfl_x = self.PAD_L + int(self._gf_low / scale * gw)
+            p.setPen(QPen(QColor(100, 200, 100), 1, Qt.PenStyle.DashLine))
+            p.drawLine(gfl_x, self.PAD_T, gfl_x, self.PAD_T + gh)
+            p.setPen(QColor(120, 210, 120))
+            p.setFont(QFont("Arial", 7))
+            p.drawText(gfl_x - 18, self.PAD_T - 12, 36, 12,
+                       Qt.AlignmentFlag.AlignCenter, f"GFl {int(self._gf_low*100)}%")
+
+            # Dynamic current-GF line (interpolated between GF_low and GF_high)
+            if self._first_stop_depth > 0:
+                cur_gf = (self._gf_high
+                          + (self._gf_low - self._gf_high)
+                          * (depth / self._first_stop_depth))
+                cur_gf = max(self._gf_low, min(self._gf_high, cur_gf))
+            else:
+                cur_gf = self._gf_high
+            cgf_x = self.PAD_L + int(cur_gf / scale * gw)
+            p.setPen(QPen(QColor(0, 220, 255), 2, Qt.PenStyle.SolidLine))
+            p.drawLine(cgf_x, self.PAD_T, cgf_x, self.PAD_T + gh)
+            p.setPen(QColor(0, 220, 255))
+            p.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+            p.drawText(cgf_x - 22, self.PAD_T - 12, 44, 12,
+                       Qt.AlignmentFlag.AlignCenter,
+                       f"GF {cur_gf*100:.0f}%")
+
+            p.setPen(QColor(120, 120, 140))
+            p.setFont(QFont("Arial", 7))
+            p.drawText(W - self.PAD_R - 120, self.PAD_T - 12, 120, 12,
+                       Qt.AlignmentFlag.AlignRight, "0% = P_amb  |  100% = M-val")
 
         for i in range(16):
             fv = fracs[i] if i < len(fracs) else 0.0
-            bar_w = int(min(fv, 1.2) / 1.2 * gw)
+            bar_w = max(0, int(fv / scale * gw))
             y     = self.PAD_T + i * (bar_h + 3)
 
             p.fillRect(self.PAD_L, y, gw, bar_h, QColor(35, 40, 50))
-            p.fillRect(self.PAD_L, y, bar_w, bar_h, _frac_color_new(fv))
+            if bar_w > 0:
+                p.fillRect(self.PAD_L, y, bar_w, bar_h, _frac_color_new(fv))
 
             p.setPen(QColor(200, 200, 200))
             p.setFont(QFont("Arial", 7))
             p.drawText(2, y, self.PAD_L - 4, bar_h,
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                        f"C{i+1}")
-            p.setFont(QFont("Arial", 7))
-            p.drawText(self.PAD_L + bar_w + 4, y, 36, bar_h,
+            p.drawText(self.PAD_L + bar_w + 4, y, 40, bar_h,
                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                        f"{fv*100:.0f}%")
 
@@ -1722,12 +1811,15 @@ class _BarWidget(QWidget):
 
 
 class _BarTab(QWidget):
-    def __init__(self, timeline: list, surface_mv: bool, parent=None):
+    def __init__(self, timeline: list, surface_mv: bool,
+                 gf_low: float = 0.55, gf_high: float = 0.80,
+                 first_stop_depth: float = 0.0, parent=None):
         super().__init__(parent)
         vl = QVBoxLayout(self)
         vl.setContentsMargins(6, 6, 6, 6)
 
-        self._bar = _BarWidget(timeline, surface_mv)
+        self._bar = _BarWidget(timeline, surface_mv, gf_low=gf_low, gf_high=gf_high,
+                               first_stop_depth=first_stop_depth)
         vl.addWidget(self._bar, 1)
 
         hl = QHBoxLayout()
@@ -1745,16 +1837,28 @@ class _BarTab(QWidget):
         hl.addWidget(self._play_btn)
         vl.addLayout(hl)
 
-        note = QLabel(
-            "ANIMATED BAR CHART — Each horizontal bar is one tissue compartment (C1 top = fastest, "
-            "C16 bottom = slowest).  Bar length = saturation fraction (pt / M-value).  "
-            "The red dashed line marks 100% of the M-value — the theoretical decompression limit; "
-            "any bar reaching it means that tissue is supersaturated beyond its safe limit.  "
-            "The yellow 90% and 75% lines are common conservative reference thresholds.  "
-            "Bar colour follows the same scale as the heatmap: blue = low load, green = moderate, "
-            "yellow/orange = approaching limit, red/purple = at or over limit.  "
-            "Use ▶ Play to watch how gas loads shift from fast to slow tissues as the dive progresses."
-        )
+        if surface_mv:
+            note_text = (
+                "ANIMATED BAR CHART (Surface M-value) — Each horizontal bar is one tissue compartment "
+                "(C1 top = fastest, C16 bottom = slowest).  Bar length = saturation fraction (pt / Surface M-value).  "
+                "The red dashed line marks 100% of the surface M-value — any bar reaching it means the tissue "
+                "is supersaturated beyond the surface limit.  The yellow 90% and 75% lines are common conservative "
+                "reference thresholds.  Scale adjusts dynamically to always fit the largest bar.  "
+                "Bar colour: blue = low load, green = moderate, yellow/orange = approaching limit, red/purple = at or over limit.  "
+                "Use ▶ Play to watch how gas loads shift from fast to slow tissues as the dive progresses."
+            )
+        else:
+            note_text = (
+                "ANIMATED BAR CHART (Depth M-value, normalised) — Each horizontal bar is one tissue compartment "
+                "(C1 top = fastest, C16 bottom = slowest).  Scale: 0% = ambient pressure (P_amb), 100% = depth-adjusted M-value.  "
+                "Negative values = tissue is still loading (below ambient equilibrium) — normal during descent and bottom phase.  "
+                "The red dashed line marks 100% (M-value limit).  "
+                "The orange GF High and green GF Low lines show the gradient factor corridor — "
+                "during deco, bars should be held at or below GF High.  "
+                "Bar colour: blue = low load, green = moderate, yellow/orange = approaching limit, red/purple = at or over limit.  "
+                "Use ▶ Play to watch how gas loads shift from fast to slow tissues as the dive progresses."
+            )
+        note = QLabel(note_text)
         note.setStyleSheet("font-size:9px; color:#888;")
         note.setWordWrap(True)
         vl.addWidget(note)
@@ -2489,7 +2593,7 @@ class TissueHeatmapWindow(QWidget):
     def __init__(self, parent, timeline: list, surface_mv: bool = True,
                  title: str = "Tissue Saturation Heatmap", stops: list = None,
                  phase_list: list = None, gf_low: float = 0.30, gf_high: float = 0.80,
-                 resimulate_fn=None):
+                 resimulate_fn=None, first_stop_depth: float = 0.0):
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle(title)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -2518,6 +2622,7 @@ class TissueHeatmapWindow(QWidget):
         btn_row.addWidget(close_btn)
         vl.addLayout(btn_row)
 
+        self._first_stop_depth = first_stop_depth
         self._build_tabs(timeline, stops or [], phase_list or [], gf_low, gf_high)
 
     # ── GF re-simulation callback ─────────────────────────────────────────────
@@ -2732,7 +2837,8 @@ class TissueHeatmapWindow(QWidget):
         tab7 = QWidget()
         t7l  = QVBoxLayout(tab7)
         t7l.setContentsMargins(4, 4, 4, 4)
-        t7l.addWidget(_BarTab(timeline, surface_mv), 1)
+        t7l.addWidget(_BarTab(timeline, surface_mv, gf_low=gf_low, gf_high=gf_high,
+                              first_stop_depth=self._first_stop_depth), 1)
         _gf_apply7 = self._on_gf_apply if self._resimulate_fn else None
         t7l.addLayout(_gf_input_bar(None, gf_low, gf_high,
                                     label="Recalculate with GF:",
