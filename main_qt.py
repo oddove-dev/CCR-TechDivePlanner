@@ -236,6 +236,40 @@ class CylinderDialog(QDialog):
         left_lay.addWidget(self._cb_jj,    len(self.INPUT_FIELDS),     0, 1, 2)
         left_lay.addWidget(self._cb_stage, len(self.INPUT_FIELDS) + 1, 0, 1, 2)
 
+        # Counterweight for positive cylinders
+        self._cb_cw = QCheckBox("Counterweight for positive cylinders")
+        self._cb_cw.stateChanged.connect(self._on_cw_toggled)
+        left_lay.addWidget(self._cb_cw, len(self.INPUT_FIELDS) + 2, 0, 1, 2)
+
+        self._lbl_cw_dry = QLabel("Counterweight dry mass [kg]:")
+        self._le_cw_dry  = QLineEdit("")
+        self._le_cw_dry.setStyleSheet("background:#ffe0e0;")
+        self._le_cw_dry.textChanged.connect(self._recalc)
+
+        self._lbl_cw_wet = QLabel("Counterweight wet mass FW [kg]:")
+        self._le_cw_wet  = QLineEdit("")
+        self._le_cw_wet.setStyleSheet("background:#ffe0e0;")
+        self._le_cw_wet.textChanged.connect(self._recalc)
+
+        self._lbl_cw_combined = QLabel("Combined wet mass FW [kg]:")
+        self._le_cw_combined  = QLineEdit("")
+        self._le_cw_combined.setStyleSheet("background:#ffe0e0;")
+        self._le_cw_combined.textChanged.connect(self._recalc)
+
+        left_lay.addWidget(self._lbl_cw_dry,      len(self.INPUT_FIELDS) + 3, 0)
+        left_lay.addWidget(self._le_cw_dry,        len(self.INPUT_FIELDS) + 3, 1)
+        left_lay.addWidget(self._lbl_cw_wet,       len(self.INPUT_FIELDS) + 4, 0)
+        left_lay.addWidget(self._le_cw_wet,        len(self.INPUT_FIELDS) + 4, 1)
+        left_lay.addWidget(self._lbl_cw_combined,  len(self.INPUT_FIELDS) + 5, 0)
+        left_lay.addWidget(self._le_cw_combined,   len(self.INPUT_FIELDS) + 5, 1)
+
+        self._lbl_cw_dry.setVisible(False)
+        self._le_cw_dry.setVisible(False)
+        self._lbl_cw_wet.setVisible(False)
+        self._le_cw_wet.setVisible(False)
+        self._lbl_cw_combined.setVisible(False)
+        self._le_cw_combined.setVisible(False)
+
         # Buttons
         btn_lay = QHBoxLayout()
         label_txt = "Save" if self._is_edit else "Add to database"
@@ -246,7 +280,7 @@ class CylinderDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         btn_lay.addWidget(ok_btn)
         btn_lay.addWidget(cancel_btn)
-        left_lay.addLayout(btn_lay, len(self.INPUT_FIELDS) + 2, 0, 1, 2)
+        left_lay.addLayout(btn_lay, len(self.INPUT_FIELDS) + 6, 0, 1, 2)
 
         # ── Right: calculated preview ─────────────────────────────────────────
         right_box = QGroupBox("Calculated preview")
@@ -269,7 +303,33 @@ class CylinderDialog(QDialog):
 
         self._recalc()
 
+    def _on_cw_toggled(self):
+        visible = self._cb_cw.isChecked()
+        self._lbl_cw_dry.setVisible(visible)
+        self._le_cw_dry.setVisible(visible)
+        self._lbl_cw_wet.setVisible(visible)
+        self._le_cw_wet.setVisible(visible)
+        self._lbl_cw_combined.setVisible(visible)
+        self._le_cw_combined.setVisible(visible)
+        wet_entry = self._entries["wet_mass"]
+        if visible:
+            wet_entry.setReadOnly(True)
+            wet_entry.setStyleSheet("background:#e0e0e0;")
+        else:
+            wet_entry.setReadOnly(False)
+            wet_entry.setStyleSheet("background:#ffe0e0;")
+            wet_entry.clear()
+        self._recalc()
+
     def _recalc(self):
+        if self._cb_cw.isChecked():
+            try:
+                cw_wet     = float(self._le_cw_wet.text().replace(",","."))
+                combined   = float(self._le_cw_combined.text().replace(",","."))
+                cyl_wet    = combined - cw_wet
+                self._entries["wet_mass"].setText(f"{cyl_wet:.4f}")
+            except ValueError:
+                self._entries["wet_mass"].setText("")
         try:
             dry  = float(self._entries["dry_mass"].text().replace(",","."))
             wet  = float(self._entries["wet_mass"].text().replace(",","."))
