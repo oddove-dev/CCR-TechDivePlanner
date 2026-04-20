@@ -11,7 +11,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as _FigCanvas
 from matplotlib.figure import Figure as _Figure
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QFrame, QGroupBox, QSizePolicy, QSplitter,
     QListWidget, QAbstractItemView, QCheckBox, QComboBox, QSpacerItem, QTabWidget,
     QMessageBox,
@@ -25,7 +25,7 @@ from buhlmann import (
     CCRConfig, OCGas, TissueState,
     _PN2_SURF, PH2O,
     select_oc_gas, _oc_ascent_waypoints,
-    TISSUES, P_SURF,
+    TISSUES, P_SURF, WATER_DENSITY,
 )
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -283,10 +283,12 @@ class DivePlannerTab(QWidget):
         self._dil_o2               = "—"   # diluent O2% read from buoyancy plan
         self._dil_he               = "—"   # diluent He% read from buoyancy plan
         self._bail_gas_chart_data  = []    # [(label, initial_L, used_L)] for chart 4
+        self._ccr_gas_chart_data   = []    # [{label, initial_L, used_L}] for CCR gas chart
         # Chart canvases (created during build)
         self._profile_canvas: _FigCanvas | None = None
         self._tissue_canvas:  _FigCanvas | None = None
         self._gas_canvas:     _FigCanvas | None = None
+        self._ccr_gas_canvas: _FigCanvas | None = None
         self._chart_tabs:     QTabWidget | None = None
 
         self._build()
@@ -294,33 +296,44 @@ class DivePlannerTab(QWidget):
     # ── Layout ────────────────────────────────────────────────────────────────
 
     def _build(self):
-        # Single QGridLayout: 3 rows × 5 columns
-        # Row 0: [sidebar|profile|settings|CCR tissue sat|Bail tissue sat]
-        # Row 1: [onboard gas ────────────|bailout gas ──────────────────]
-        # Row 2: [dive plan CCR ──────────|bailout plan OC ───────────────]
-        # The col-2/col-3 boundary is shared by all rows → perfect midline alignment.
+        # Top row (grid): sidebar fixed 360 | container (onboard 620 + settings) | stretch
+        # Bottom row (HBox): ccr_plan fixed 1136 (=360+6+770) | bailout expanding
+        # → vertical divider at x=6+360+6+770=1142 in both rows.
+        _SIDEBAR_W  = 360
+        _ONBOARD_W  = 770
+        _SPACING    = 6
+        _CCR_PLAN_W = _SIDEBAR_W + _SPACING + _ONBOARD_W   # 1136
+
         grid_l = QGridLayout(self)
-        grid_l.setContentsMargins(6, 6, 6, 6)
-        grid_l.setSpacing(6)
-        # Equal stretch for all 5 columns so panels share the same column widths
-        for c in range(5):
-            grid_l.setColumnStretch(c, 1)
-        grid_l.setRowStretch(0, 1)   # top row holds consistent height
-        grid_l.setRowStretch(1, 3)   # plan row expands more
+        grid_l.setContentsMargins(_SPACING, _SPACING, _SPACING, _SPACING)
+        grid_l.setSpacing(_SPACING)
+        grid_l.setColumnStretch(0, 0)   # sidebar — fixed width
+        grid_l.setColumnStretch(1, 1)   # onboard+settings container — expands
+        grid_l.setRowStretch(0, 0)      # top row — fixed height
+        grid_l.setRowStretch(1, 1)      # bottom row — expands
 
-        # Row 0: sidebar (col 0), onboard (cols 1-4, depth profile inside)
+        # ── Top row ──────────────────────────────────────────────────────────
         self._build_sidebar(grid_l, 0, 0)
-        self._build_onboard(grid_l, 0, 1)   # spans cols 1-4
+        self._build_onboard(grid_l, 0, 1)
 
-        # Row 1: dive plans
-        self._build_ccr_plan(grid_l, 1, 0)
-        self._build_bail_plan(grid_l, 1, 3)
+        # ── Bottom row — single widget spanning col 0+1 ───────────────────────
+        bot_w  = QWidget()
+        bot_hl = QHBoxLayout(bot_w)
+        bot_hl.setContentsMargins(0, 0, 0, 0)
+        bot_hl.setSpacing(_SPACING)
+
+        self._build_ccr_plan(bot_hl,  _CCR_PLAN_W)
+        self._build_bail_plan(bot_hl)
+
+        grid_l.addWidget(bot_w, 1, 0, 1, 2)
 
     # ── Sidebar (Deco Profiles) ───────────────────────────────────────────────
 
     def _build_sidebar(self, grid_layout, grid_row, grid_col):
         # Outer container: tabs on top, shared controls below
         outer_w  = QWidget()
+        outer_w.setFixedWidth(360)
+        outer_w.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding)
         outer_vl = QVBoxLayout(outer_w)
         outer_vl.setContentsMargins(0, 0, 0, 0)
         outer_vl.setSpacing(4)
@@ -481,71 +494,70 @@ class DivePlannerTab(QWidget):
 
     # Settings field definitions (label, attr, default)
     _SETTINGS_FIELDS = [
-        ("CCR Descend PO2 [bar]",    "_sp_desc",     "0.7"),
-        ("CCR Bottom PO2 [bar]",     "_sp",          "1.3"),
-        ("CCR Deco PO2 [bar]",       "_sp_deco",     "1.6"),
-        ("CCR Deko last stop [m]",   "_last_stop",   "3"),
-        ("GF Low [%]",               "_gf_lo",       "30"),
-        ("GF High [%]",              "_gf_hi",       "80"),
-        ("Descent rate [m/min]",     "_desc_r",      "20"),
-        ("Ascent rate [m/min]",      "_asc_r",       "9"),
-        ("Deco rate [m/min]",        "_deco_r",      "3"),
-        ("SAC rate [L/min]",         "_sac",         "20"),
-        ("Deco switch PO2 BO [bar]", "_deko_sw",     "1.6"),
-        ("Stop interval [m]",        "_stop_int",    "3"),
-        ("Display interval [m]",     "_display_int", "3"),
-        ("Heatmap interval [min]",   "_heatmap_int", "0.1"),
+        ("Descend SP [bar]",   "_sp_desc",     "0.7"),
+        ("Bottom SP [bar]",    "_sp",          "1.3"),
+        ("Deco SP [bar]",      "_sp_deco",     "1.6"),
+        ("Last stop [m]",      "_last_stop",   "3"),
+        ("GF Low [%]",         "_gf_lo",       "30"),
+        ("GF High [%]",        "_gf_hi",       "80"),
+        ("Descent [m/min]",    "_desc_r",      "20"),
+        ("Ascent [m/min]",     "_asc_r",       "9"),
+        ("Deco rate [m/min]",  "_deco_r",      "3"),
+        ("SAC [L/min]",        "_sac",         "20"),
+        ("BO deco sw SP [bar]","_deko_sw",     "1.6"),
+        ("Stop interval [m]",  "_stop_int",    "3"),
+        ("Display int [m]",    "_display_int", "3"),
+        ("Heatmap int [min]",  "_heatmap_int", "0.1"),
+        ("Loop vol [L]",       "_ccr_loop_vol","7"),
+        ("Metab O2 [L/min]",   "_ccr_o2_rate", "0.3"),
+        ("Drysuit vol [L]",    "_ccr_suit_vol","4"),
     ]
 
     def _build_settings(self):
-        """Build settings widget (used as a tab). Returns the widget."""
+        """Build settings widget. Returns the QGroupBox."""
         box = QGroupBox("Settings")
-        outer_vl = QVBoxLayout(box)
-        outer_vl.setContentsMargins(6, 8, 6, 6)
-        outer_vl.setSpacing(4)
+        box.setFixedWidth(560)
+        box.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding)
 
-        fields_w = QWidget()
-        box_l = QHBoxLayout(fields_w)
-        box_l.setContentsMargins(0, 0, 0, 0)
-        box_l.setSpacing(8)
+        grid = QGridLayout(box)
+        grid.setContentsMargins(10, 10, 10, 10)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(4)
 
-        fields = self._SETTINGS_FIELDS
-        mid = (len(fields) + 1) // 2
+        half = (len(self._SETTINGS_FIELDS) + 1) // 2
 
-        for col_fields in [fields[:mid], fields[mid:]]:
-            col_w = QWidget()
-            col_w.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
-            col_l = QGridLayout(col_w)
-            col_l.setContentsMargins(0, 0, 0, 0)
-            col_l.setSpacing(2)
-            for r, (label, attr, default) in enumerate(col_fields):
-                lbl = QLabel(label + ":")
-                lbl.setFixedWidth(180)
-                le  = QLineEdit(default)
-                le.setFixedWidth(60)
-                le.setAlignment(Qt.AlignmentFlag.AlignRight)
-                le.setStyleSheet(f"background:{CLR_INPUT};")
-                setattr(self, attr + "_le", le)
-                le.textChanged.connect(self._on_input_change)
-                col_l.addWidget(lbl, r, 0)
-                col_l.addWidget(le,  r, 1)
-            box_l.addWidget(col_w)
+        # 5 columns: 0=left-label 1=left-entry 2=separator 3=right-label 4=right-entry
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet("color:#cccccc;")
+        grid.addWidget(sep, 0, 2, half, 1)
+        grid.setColumnMinimumWidth(2, 8)
 
-        box_l.addStretch()
-        outer_vl.addWidget(fields_w)
+        for i, (label, attr, default) in enumerate(self._SETTINGS_FIELDS):
+            if i < half:
+                row, col_lbl, col_ent = i, 0, 1
+            else:
+                row, col_lbl, col_ent = i - half, 3, 4
 
-        # Save button row
-        btn_row = QHBoxLayout()
+            lbl = QLabel(label + ":")
+            le  = QLineEdit(default)
+            le.setFixedWidth(60)
+            le.setAlignment(Qt.AlignmentFlag.AlignRight)
+            le.setStyleSheet(f"background:{CLR_INPUT};")
+            setattr(self, attr + "_le", le)
+            le.textChanged.connect(self._on_input_change)
+
+            grid.addWidget(lbl, row, col_lbl, Qt.AlignmentFlag.AlignLeft)
+            grid.addWidget(le,  row, col_ent, Qt.AlignmentFlag.AlignRight)
+
+        # Save button row at bottom
         self._settings_status_lbl = QLabel("")
         self._settings_status_lbl.setStyleSheet("color:#44cc88; font-size:9px;")
         save_btn = QPushButton("Save settings")
-        save_btn.setFixedWidth(110)
         save_btn.setStyleSheet("background:#2a5a2a; color:white; font-weight:bold; padding:3px 8px;")
         save_btn.clicked.connect(self._save_global_settings)
-        btn_row.addStretch()
-        btn_row.addWidget(self._settings_status_lbl)
-        btn_row.addWidget(save_btn)
-        outer_vl.addLayout(btn_row)
+        grid.addWidget(self._settings_status_lbl, half, 0, 1, 2, Qt.AlignmentFlag.AlignRight)
+        grid.addWidget(save_btn, half, 3, 1, 2)
 
         return box
 
@@ -578,7 +590,7 @@ class DivePlannerTab(QWidget):
         ccr_ts_l.setContentsMargins(6, 8, 6, 6)
         ccr_ts_l.setSpacing(4)
 
-        _TAB_NAMES = ["Saturation heatmap", "Leading compartment", "Bar chart (animated)"]
+        _TAB_NAMES = ["Saturation heatmap", "Leading compartment", "Bar chart"]
 
         surf_box = QGroupBox("Surface M-value")
         surf_box.setStyleSheet("QGroupBox { color: #4488cc; }")
@@ -606,6 +618,9 @@ class DivePlannerTab(QWidget):
         dep_l.addStretch()
         ccr_ts_l.addWidget(dep_box)
 
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(6)
+
         gf_box = QGroupBox("GF Comparison")
         gf_box.setStyleSheet("QGroupBox { color: #aa8844; }")
         gf_l = QHBoxLayout(gf_box)
@@ -614,7 +629,19 @@ class DivePlannerTab(QWidget):
         b_gf.setStyleSheet("background:#7a5c00; color:white; font-weight:bold; padding:3px 8px;")
         b_gf.clicked.connect(self._open_gf_comparison)
         gf_l.addWidget(b_gf); gf_l.addStretch()
-        ccr_ts_l.addWidget(gf_box)
+
+        amb_box = QGroupBox("Ambient pressure")
+        amb_box.setStyleSheet("QGroupBox { color: #7788aa; }")
+        amb_l = QHBoxLayout(amb_box)
+        amb_l.setContentsMargins(4, 8, 4, 4)
+        b_inert = QPushButton("Inert gas pressure")
+        b_inert.setStyleSheet("background:#2a3a55; color:white; font-weight:bold; padding:3px 8px;")
+        b_inert.clicked.connect(self._open_inert_gas_window)
+        amb_l.addWidget(b_inert); amb_l.addStretch()
+
+        bottom_row.addWidget(gf_box)
+        bottom_row.addWidget(amb_box)
+        ccr_ts_l.addLayout(bottom_row)
         return ccr_ts
 
     # ── Bailout Tissue Saturations panel ──────────────────────────────────────
@@ -626,7 +653,7 @@ class DivePlannerTab(QWidget):
         bail_ts_l.setContentsMargins(6, 8, 6, 6)
         bail_ts_l.setSpacing(4)
 
-        _TAB_NAMES = ["Saturation heatmap", "Leading compartment", "Bar chart (animated)"]
+        _TAB_NAMES = ["Saturation heatmap", "Leading compartment", "Bar chart"]
 
         bail_surf_box = QGroupBox("Surface M-value")
         bail_surf_box.setStyleSheet("QGroupBox { color: #4488cc; }")
@@ -1024,6 +1051,8 @@ class DivePlannerTab(QWidget):
 
     def _build_onboard(self, grid_layout, grid_row, grid_col):
         box = QGroupBox("Onboard Gas")
+        box.setFixedWidth(770)
+        box.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding)
         outer_hl = QHBoxLayout(box)
         outer_hl.setContentsMargins(6, 8, 6, 6)
         outer_hl.setSpacing(8)
@@ -1127,14 +1156,7 @@ class DivePlannerTab(QWidget):
         tissue_hl.addWidget(self._build_bail_tissue_sat())
         self._chart_tabs.addTab(tissue_tab, "Tissue saturations")
 
-        # Tab 2 — Tissue saturation
-        fig2 = _Figure(figsize=(4, 2.2), facecolor="#1a1a2e")
-        fig2.subplots_adjust(left=0.10, right=0.97, top=0.88, bottom=0.18)
-        self._tissue_canvas = _FigCanvas(fig2)
-        tab2 = QWidget()
-        QVBoxLayout(tab2).addWidget(self._tissue_canvas)
-        tab2.layout().setContentsMargins(0, 0, 0, 0)
-        self._chart_tabs.addTab(tab2, "Vevsmettning")
+        self._tissue_canvas = None  # no longer an inline tab — opened via popup
 
         # Tab 3 — Gas consumption
         fig3 = _Figure(figsize=(4, 2.2), facecolor="#1a1a2e")
@@ -1143,7 +1165,16 @@ class DivePlannerTab(QWidget):
         tab3 = QWidget()
         QVBoxLayout(tab3).addWidget(self._gas_canvas)
         tab3.layout().setContentsMargins(0, 0, 0, 0)
-        self._chart_tabs.addTab(tab3, "Gassforbruk")
+        self._chart_tabs.addTab(tab3, "BO Gas consumption")
+
+        # Tab 4 — CCR Gas consumption
+        fig4 = _Figure(figsize=(4, 2.2), facecolor="#1a1a2e")
+        fig4.subplots_adjust(left=0.10, right=0.97, top=0.88, bottom=0.22)
+        self._ccr_gas_canvas = _FigCanvas(fig4)
+        tab4 = QWidget()
+        QVBoxLayout(tab4).addWidget(self._ccr_gas_canvas)
+        tab4.layout().setContentsMargins(0, 0, 0, 0)
+        self._chart_tabs.addTab(tab4, "CCR Gas consumption")
 
         outer_hl.addWidget(self._chart_tabs, stretch=1)
         outer_hl.setContentsMargins(0, 0, 0, 0)
@@ -1153,15 +1184,18 @@ class DivePlannerTab(QWidget):
 
         # ── Container holding both group boxes side by side ──────────────────
         container = QWidget()
+        container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        container.setFixedHeight(320)
         container_hl = QHBoxLayout(container)
         container_hl.setContentsMargins(0, 0, 0, 0)
         container_hl.setSpacing(4)
+        container_hl.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         settings_box.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
 
-        container_hl.addWidget(box, stretch=1)
-        container_hl.addWidget(settings_box, stretch=0)
+        container_hl.addWidget(box,          0)
+        container_hl.addWidget(settings_box, 0)
+        container_hl.addStretch(1)
 
         grid_layout.addWidget(container, grid_row, grid_col, 1, 4)   # spans cols 1-4
 
@@ -1506,8 +1540,10 @@ class DivePlannerTab(QWidget):
 
     # ── CCR Dive Plan result panel ────────────────────────────────────────────
 
-    def _build_ccr_plan(self, grid_layout, row, col):
+    def _build_ccr_plan(self, hbox_layout, fixed_width: int):
         box = QGroupBox("Dive plan  (CCR)")
+        box.setFixedWidth(fixed_width)
+        box.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         vl  = QVBoxLayout(box)
         vl.setContentsMargins(6, 8, 6, 6)
         vl.setSpacing(2)
@@ -1525,15 +1561,17 @@ class DivePlannerTab(QWidget):
                         ("O2[bar]",  55, "e"), ("O2[L]",  45, "e"),
                         ("Infl[bar]", 60, "e"), ("Infl[L]", 45, "e"),
                         ("BCD[bar]", 60, "e"), ("BCD[L]", 45, "e"),
-                        ("Buoyancy[kg]", 95, "e")],
+                        ("Buoyancy[kg]", 95, "e"),
+                        ("Loop O2%", 60, "e"), ("Loop He%", 55, "e")],
         )
 
-        grid_layout.addWidget(box, row, col, 1, 3)   # spans cols 0-2
+        hbox_layout.addWidget(box, 0)
 
     # ── Bailout Plan result panel ─────────────────────────────────────────────
 
-    def _build_bail_plan(self, grid_layout, row, col):
+    def _build_bail_plan(self, hbox_layout):
         box = QGroupBox("Bailout plan  (OC)")
+        box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         vl  = QVBoxLayout(box)
         vl.setContentsMargins(6, 8, 6, 6)
         vl.setSpacing(2)
@@ -1551,7 +1589,7 @@ class DivePlannerTab(QWidget):
                         ("Buoyancy[kg]", 95, "e"), ("m/drop[kg]", 85, "e")],
         )
 
-        grid_layout.addWidget(box, row, col, 1, 2)   # spans cols 3-4
+        hbox_layout.addWidget(box, 1)
 
     def _build_result_table(self, parent_vl, base_cols, extra_cols):
         """Build a scrollable result table. Returns the inner content widget."""
@@ -1576,6 +1614,7 @@ class DivePlannerTab(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setMinimumHeight(180)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         inner = QWidget()
         inner._cols = all_cols
@@ -1594,6 +1633,7 @@ class DivePlannerTab(QWidget):
         if self._loading:
             return
         self._update_dil_from_plan(plan_name)
+        self._sync_suit_vol_from_plan(plan_name)
         self._rebuild_gas_rows([])
         self._update_cyl_dropdowns(plan_name)
         self._schedule_recalc()
@@ -1627,6 +1667,35 @@ class DivePlannerTab(QWidget):
         else:
             self._dil_o2 = "—"
             self._dil_he = "—"
+
+    def _sync_suit_vol_from_plan(self, plan_name: str):
+        """Auto-populate CCR drysuit volume from the diver buoyancy in the selected plan."""
+        le = getattr(self, "_ccr_suit_vol_le", None)
+        if le is None:
+            return
+        user = self._bp_tab._current_user()
+        plan_state = None
+        if plan_name and plan_name != "—" and user in self._db.get("users", {}):
+            plan_state = (self._db["users"][user]
+                          .get("buoyancy_plans", {}).get(plan_name))
+        if not plan_state:
+            return
+        eslots = plan_state.get("eslots", [])
+        diver_name = eslots[0].get("sel", "—") if eslots else "—"
+        if not diver_name or diver_name == "—":
+            return
+        diver = next((d for d in self._db.get("divers", [])
+                      if d.get("name") == diver_name), None)
+        if diver is None:
+            return
+        lead_dry = float(diver.get("lead_dry_mass") or 0)
+        if lead_dry <= 0:
+            return
+        v_lead      = lead_dry / RHO_PB
+        buoy_sw_kg  = lead_dry - v_lead * RHO_SW   # diver_buoyancy_sw
+        suit_vol_L  = buoy_sw_kg / RHO_SW
+        if suit_vol_L > 0:
+            le.setText(f"{suit_vol_L:.1f}")
 
     def _update_onboard_info(self, plan_state_bp):
         """Fill Name/Press/Mix labels in the Onboard Gas tab from the buoyancy plan."""
@@ -1690,6 +1759,7 @@ class DivePlannerTab(QWidget):
                 self.sync_plan(bp_plan)
         # Always restore global settings (profiles must not override them)
         self._load_global_settings()
+        self._sync_suit_vol_from_plan(self._stage_plan_cb.currentText())
 
     def _refresh_stage_plan_cb(self):
         user  = self._bp_tab._current_user()
@@ -1993,10 +2063,11 @@ class DivePlannerTab(QWidget):
     # ── Embedded chart updates ────────────────────────────────────────────────
 
     def _update_charts(self, segments=None):
-        """Redraw all three embedded matplotlib charts."""
+        """Redraw all embedded matplotlib charts."""
         self._draw_profile_chart(segments)
         self._draw_tissue_chart()
         self._draw_gas_chart()
+        self._draw_ccr_gas_chart()
 
     def _draw_profile_chart(self, segments=None):
         if self._profile_canvas is None:
@@ -2183,11 +2254,61 @@ class DivePlannerTab(QWidget):
         ax.set_ylim(-max_init * 0.05, max_init * 1.18)
         ax.set_ylabel("L", fontsize=7, color="#99aacc")
         ax.tick_params(labelsize=7, colors="#99aacc")
-        ax.set_title("Gassforbruk  (Bailout OC)", fontsize=8, color="#aabbdd", pad=3)
+        ax.set_title("BO Gas consumption  (Bailout OC)", fontsize=8, color="#aabbdd", pad=3)
         ax.grid(True, axis="y", color="#1e1e3a", linewidth=0.5, linestyle=":")
         for sp in ax.spines.values():
             sp.set_edgecolor("#2a2a4a")
         self._gas_canvas.draw()
+
+    def _draw_ccr_gas_chart(self):
+        if self._ccr_gas_canvas is None:
+            return
+        fig = self._ccr_gas_canvas.figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#12122a")
+
+        COLS       = ["#4a90d9", "#e04040", "#50c060", "#f0a030"]
+        role_labels = ["Diluent", "O2 (pure)", "Inflation gas", "BCD gas"]
+
+        data  = (self._ccr_gas_chart_data + [{}] * 4)[:4]
+        bar_w = 0.6
+        max_init = max((d.get("initial_L", 0) for d in data), default=1.0)
+        if max_init == 0:
+            max_init = 1.0
+
+        for i, (d, col) in enumerate(zip(data, COLS)):
+            init    = d.get("initial_L", 0.0)
+            used    = d.get("used_L",    0.0)
+            gas_lbl = d.get("label", "")
+            role    = role_labels[i]
+
+            ax.bar(i, max(init, max_init * 0.04), width=bar_w,
+                   color="#22224a", edgecolor="#3a3a6a", linewidth=0.6, zorder=2)
+
+            if init > 0:
+                ax.bar(i, min(used, init), width=bar_w, color=col, alpha=0.85, zorder=3)
+                pct = used / init * 100
+                ax.text(i, min(used, init) + max_init * 0.03, f"{pct:.0f}%",
+                        ha="center", va="bottom", color=col,
+                        fontsize=7, fontweight="bold")
+            else:
+                ax.text(i, max_init * 0.06, "—", ha="center", va="bottom",
+                        color="#445566", fontsize=9)
+
+            tick_lbl = f"{role}\n{gas_lbl}" if gas_lbl else role
+            ax.text(i, -max_init * 0.12, tick_lbl, ha="center", va="top",
+                    color="#99aacc", fontsize=6.5, transform=ax.transData)
+
+        ax.set_xticks([])
+        ax.set_ylim(-max_init * 0.05, max_init * 1.18)
+        ax.set_ylabel("L", fontsize=7, color="#99aacc")
+        ax.tick_params(labelsize=7, colors="#99aacc")
+        ax.set_title("CCR Gas consumption", fontsize=8, color="#aabbdd", pad=3)
+        ax.grid(True, axis="y", color="#1e1e3a", linewidth=0.5, linestyle=":")
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#2a2a4a")
+        self._ccr_gas_canvas.draw()
 
     def _open_tissue_window(self, surface_mv=True, bailout=False, tab=0):
         """Open a tissue heatmap popup window at the given tab index."""
@@ -2210,9 +2331,9 @@ class DivePlannerTab(QWidget):
                 gf_low=self._last_gf_low, gf_high=self._last_gf_high,
                 resimulate_fn=None if bailout else self.resimulate_with_gf,
                 first_stop_depth=first_stop,
+                single_tab=tab,
             )
             win.show()
-            win._tabs.setCurrentIndex(tab)
         except ImportError:
             QMessageBox.information(self, "Info",
                 "Tissue heatmap visualization not yet implemented.")
@@ -2234,6 +2355,69 @@ class DivePlannerTab(QWidget):
             for s in result.stops
         ]
         return result.tissue_timeline, stops, result.tissue_phase_list
+
+    def _open_inert_gas_window(self):
+        """Open standalone Inert gas pressure popup."""
+        tl = self._tissue_timeline
+        if not tl or len(tl) < 2:
+            QMessageBox.information(self, "No Data",
+                "Run a dive calculation first.")
+            return
+
+        import matplotlib.cm as _cm
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as _FC
+        from matplotlib.figure import Figure as _Fig
+
+        win = QWidget(self, Qt.WindowType.Window)
+        win.setWindowTitle("Inert gas pressure — CCR")
+        win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        win.resize(820, 440)
+
+        fig = _Fig(figsize=(8, 4), facecolor="#1a1a2e")
+        fig.subplots_adjust(left=0.08, right=0.97, top=0.90, bottom=0.12)
+        canvas = _FC(fig)
+
+        vl = QVBoxLayout(win)
+        vl.setContentsMargins(4, 4, 4, 4)
+        vl.addWidget(canvas)
+
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#12122a")
+
+        cmap = _cm.get_cmap("coolwarm", 16) if hasattr(_cm, "get_cmap") else \
+               _cm.colormaps["coolwarm"].resampled(16)
+
+        import numpy as _np2
+        times  = _np2.array([p[0] for p in tl])
+        depths = _np2.array([p[1] for p in tl])
+        sp     = self._get_setting("_sp", 1.3)
+        p_amb  = P_SURF + depths * WATER_DENSITY / 10.0
+        p_inert_inspired = _np2.maximum(0.0, p_amb - sp - PH2O)
+
+        n_tis = len(tl[0][2]) if tl[0][2] else 0
+        for ti in range(n_tis):
+            sats = _np2.array([p[2][ti][0] + p[2][ti][1]
+                               if len(p[2][ti]) > 1 else p[2][ti][0]
+                               for p in tl])
+            col   = cmap(ti / max(n_tis - 1, 1))
+            alpha = 0.5 if ti not in (0, 3, 7, 11, 15) else 0.95
+            lw    = 0.8 if ti not in (0, 3, 7, 11, 15) else 1.6
+            ax.plot(times, sats, color=col, linewidth=lw, alpha=alpha)
+
+        ax.plot(times, p_inert_inspired, color="#ffdd44", linewidth=1.4,
+                linestyle="--", alpha=0.85, label="P inert ambient (CCR)", zorder=5)
+        ax.axhline(0.79, color="#6688ff", linewidth=0.7, linestyle=":", alpha=0.5)
+        ax.legend(fontsize=7, facecolor="#1a1a2e", edgecolor="#2a2a4a",
+                  labelcolor="#ffdd44", loc="upper right")
+        ax.set_xlabel("Time [min]", fontsize=8, color="#99aacc")
+        ax.set_ylabel("P inert [bar]", fontsize=8, color="#99aacc")
+        ax.tick_params(labelsize=7, colors="#99aacc")
+        ax.set_title("Inert gas pressure — CCR", fontsize=9, color="#aabbdd", pad=4)
+        ax.grid(True, color="#1e1e3a", linewidth=0.5, linestyle=":")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#2a2a4a")
+        canvas.draw()
+        win.show()
 
     def _open_gf_comparison(self):
         """Open Fixed Bottom Time GF Comparison window."""
@@ -2519,20 +2703,40 @@ class DivePlannerTab(QWidget):
         sp_desc_lbl   = ccr.sp_label(sp=ccr.sp_descend)
         sp_deco_lbl   = ccr.sp_label(sp=ccr.sp_deco) if hasattr(ccr, "sp_deco") else sp_bottom_lbl
 
-        def _onboard_extra(sp_label=""):
+        def _onboard_extra(sp_label="", sp_value=None, depth=0.0):
+            # Compute loop gas composition at this row's depth and setpoint
+            p_amb = P_SURF + depth * WATER_DENSITY / 10.0
+            dil_fo2 = ccr.diluent_o2          # fraction (0-1)
+            dil_fhe = ccr.diluent_he
+            dil_fin = 1.0 - dil_fo2 - dil_fhe  # inert (N2+He)
+            if sp_value is None or sp_value <= 0 or p_amb <= 0:
+                # Descent: loop = diluent composition
+                loop_fo2 = dil_fo2
+                loop_fhe = dil_fhe
+            else:
+                loop_fo2 = min(sp_value / p_amb, 1.0)
+                remaining = 1.0 - loop_fo2
+                if dil_fin > 0 and dil_fhe > 0:
+                    loop_fhe = remaining * (dil_fhe / dil_fin)
+                else:
+                    loop_fhe = 0.0
+            lo2_str = f"{loop_fo2*100:.0f}%"
+            lhe_str = f"{loop_fhe*100:.0f}%" if dil_fhe > 0 else "—"
             return [(sp_label, 60, "w"),
                     (dil_p, 55, "e"), (dil_v, 45, "e"),
                     (o2_p,  55, "e"), (o2_v,  45, "e"),
                     (infl_p, 60, "e"), (infl_v, 45, "e"),
                     (bcd_p, 60, "e"), (bcd_v, 45, "e"),
-                    (ccr_buoy_str, 95, "e")]
+                    (ccr_buoy_str, 95, "e"),
+                    (lo2_str, 60, "e"), (lhe_str, 55, "e")]
 
         # Build CCR display rows (pre-deco + deco stops)
         ccr_display, ccr_extra = [], []
         for s in self._saved_stops:
             sp_lbl = s["gas"].split(" dil")[0] if " dil" in s["gas"] else s["gas"]
             ccr_display.append({**s, "gas": dil_mix})
-            ccr_extra.append(_onboard_extra(sp_label=sp_lbl))
+            ccr_extra.append(_onboard_extra(sp_label=sp_lbl,
+                                            sp_value=ccr.sp_deco, depth=s["depth"]))
 
         if ccr_display and segments:
             # Use the simulation's actual first_stop depth (the rounded ceiling at
@@ -2544,7 +2748,7 @@ class DivePlannerTab(QWidget):
 
             pre_rows.append({"_label": "@ 0m", "depth": 0.0, "time": 0,
                               "runtime": 0, "gas": dil_mix})
-            pre_extra.append(_onboard_extra(sp_label=""))
+            pre_extra.append(_onboard_extra(sp_label="", sp_value=None, depth=0.0))
 
             for seg_depth, total_seg_time in segments:
                 t_travel = 0.0
@@ -2553,11 +2757,13 @@ class DivePlannerTab(QWidget):
                     rate       = desc_r if going_down else asc_r
                     t_travel   = abs(seg_depth - cur_d) / rate
                     sp_tr      = sp_desc_lbl if going_down else sp_bottom_lbl
+                    sp_val_tr  = None if going_down else ccr.setpoint
                     label_tr   = f"{'↓' if going_down else '↑'}{cur_d:.0f}→{seg_depth:.0f}m"
                     cur_rt    += t_travel
                     pre_rows.append({"_label": label_tr, "depth": seg_depth,
                                      "time": t_travel, "runtime": cur_rt, "gas": dil_mix})
-                    pre_extra.append(_onboard_extra(sp_label=sp_tr))
+                    pre_extra.append(_onboard_extra(sp_label=sp_tr,
+                                                    sp_value=sp_val_tr, depth=seg_depth))
                     cur_d = seg_depth
                 t_at = max(0.0, total_seg_time - t_travel)
                 if t_at > 0:
@@ -2565,7 +2771,8 @@ class DivePlannerTab(QWidget):
                     pre_rows.append({"_label": f"{seg_depth:.0f}m", "depth": seg_depth,
                                      "time": t_at, "runtime": cur_rt, "gas": dil_mix,
                                      "_show_time": True})
-                    pre_extra.append(_onboard_extra(sp_label=sp_bottom_lbl))
+                    pre_extra.append(_onboard_extra(sp_label=sp_bottom_lbl,
+                                                    sp_value=ccr.setpoint, depth=seg_depth))
 
             if cur_d > real_first_stop:
                 # Ascent from bottom to simulation's first_stop at ascent rate
@@ -2574,7 +2781,8 @@ class DivePlannerTab(QWidget):
                 pre_rows.append({"_label": f"↑{cur_d:.0f}→{real_first_stop:.0f}m",
                                   "depth": real_first_stop, "time": t_tr, "runtime": cur_rt,
                                   "gas": dil_mix})
-                pre_extra.append(_onboard_extra(sp_label=sp_bottom_lbl))
+                pre_extra.append(_onboard_extra(sp_label=sp_bottom_lbl,
+                                                sp_value=ccr.setpoint, depth=real_first_stop))
 
                 # If 0-min stops exist between first_stop and first stop with
                 # actual wait time, show them as a deco-rate transit row so the
@@ -2586,7 +2794,8 @@ class DivePlannerTab(QWidget):
                     pre_rows.append({"_label": f"↑{real_first_stop:.0f}→{first_wait_depth:.0f}m (deco rate)",
                                       "depth": first_wait_depth, "time": t_deco_tr,
                                       "runtime": cur_rt, "gas": dil_mix})
-                    pre_extra.append(_onboard_extra(sp_label=sp_deco_lbl))
+                    pre_extra.append(_onboard_extra(sp_label=sp_deco_lbl,
+                                                    sp_value=ccr.sp_deco, depth=first_wait_depth))
 
             ccr_display = pre_rows + ccr_display
             ccr_extra   = pre_extra + ccr_extra
@@ -2595,7 +2804,7 @@ class DivePlannerTab(QWidget):
         if ccr_display and result:
             ccr_display.append({"_label": "↑ Surface", "depth": 0.0, "time": "",
                                 "runtime": result.runtime, "gas": dil_mix})
-            ccr_extra.append(_onboard_extra(sp_label=""))
+            ccr_extra.append(_onboard_extra(sp_label="", sp_value=None, depth=0.0))
 
         self._render_stops(ccr_display, self._ccr_table_area,
                            extra_data=ccr_extra if ccr_extra else None,
@@ -2945,6 +3154,33 @@ class DivePlannerTab(QWidget):
 
         self._render_stops(display_list, self._bail_table_area,
                            extra_data=bail_extra, has_pre_gas=False)
+
+        # ── CCR gas consumption chart data ───────────────────────────────────
+        if result and segments:
+            V_loop   = self._get_setting("_ccr_loop_vol",  7.0)
+            o2_rate  = self._get_setting("_ccr_o2_rate",   0.3)
+            V_suit   = self._get_setting("_ccr_suit_vol",  4.0)
+            max_d    = max(d for d, _ in segments)
+            p_bottom = P_SURF + max_d * WATER_DENSITY / 10.0
+            delta_p  = max(0.0, p_bottom - P_SURF)
+
+            dil_used  = V_loop * delta_p
+            o2_used   = o2_rate * result.runtime
+            infl_used = V_suit  * delta_p
+
+            # Initial volumes from onboard slots (already computed as strings)
+            def _parse_vol(s):
+                try:    return float(str(s).strip())
+                except: return 0.0
+
+            self._ccr_gas_chart_data = [
+                {"label": dil_mix,    "initial_L": _parse_vol(dil_v),  "used_L": dil_used},
+                {"label": "O2 100%",  "initial_L": _parse_vol(o2_v),   "used_L": o2_used},
+                {"label": "Inflation","initial_L": _parse_vol(infl_v),  "used_L": infl_used},
+                {"label": "BCD",      "initial_L": _parse_vol(bcd_v),   "used_L": 0.0},
+            ]
+        else:
+            self._ccr_gas_chart_data = []
 
         self._update_charts(segments)
 

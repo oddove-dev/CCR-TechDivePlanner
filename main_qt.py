@@ -1764,7 +1764,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CCR-TechDivePlanner")
-        self.resize(1400, 900)
+        self.resize(1800, 900)
+        self.setMinimumWidth(1720)
 
         self._db = load_db()
 

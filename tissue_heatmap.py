@@ -2626,13 +2626,15 @@ class TissueHeatmapWindow(QWidget):
     def __init__(self, parent, timeline: list, surface_mv: bool = True,
                  title: str = "Tissue Saturation Heatmap", stops: list = None,
                  phase_list: list = None, gf_low: float = 0.30, gf_high: float = 0.80,
-                 resimulate_fn=None, first_stop_depth: float = 0.0):
+                 resimulate_fn=None, first_stop_depth: float = 0.0,
+                 single_tab: int = -1):
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle(title)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.resize(1000, 620)
 
         self._surface_mv    = surface_mv
+        self._single_tab    = single_tab
         self._title         = title
         self._resimulate_fn = resimulate_fn
 
@@ -2657,6 +2659,10 @@ class TissueHeatmapWindow(QWidget):
 
         self._first_stop_depth = first_stop_depth
         self._build_tabs(timeline, stops or [], phase_list or [], gf_low, gf_high)
+
+        if single_tab >= 0:
+            self._tabs.setCurrentIndex(single_tab)
+            self._tabs.tabBar().setVisible(False)
 
     # ── GF re-simulation callback ─────────────────────────────────────────────
 
@@ -2877,7 +2883,7 @@ class TissueHeatmapWindow(QWidget):
         t7l.addLayout(_gf_input_bar(None, gf_low, gf_high,
                                     label="Recalculate with GF:",
                                     on_apply=_gf_apply7))
-        tabs.addTab(tab7, "Bar chart (animated)" + _mv_tag)
+        tabs.addTab(tab7, "Bar chart" + _mv_tag)
 
         # restore previous tab position if possible
         if 0 <= cur_idx < tabs.count():
