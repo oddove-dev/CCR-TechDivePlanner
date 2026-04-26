@@ -104,6 +104,18 @@ def save_db(db: dict) -> None:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
 
+def migrate_baseline_buoyancy_flag(db: dict) -> None:
+    """One-time migration: set baseline_buoyancy=True on all existing diver records.
+    Equipment items (lead, canisters) are intentionally excluded.
+    """
+    if db.get("_baseline_buoyancy_migrated"):
+        return
+    for diver in db.get("divers", []):
+        diver.setdefault("baseline_buoyancy", True)
+    db["_baseline_buoyancy_migrated"] = True
+    save_db(db)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper widgets
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,14 +423,20 @@ class EquipmentDialog(QDialog):
         ("JJ Modular Buoyancy", "jj_modular"),
         ("Diver Buoyancy",      "diver_buoyancy"),
         ("Stage Buoyancy",      "stage"),
+        ("Baseline Buoyancy",   "baseline_buoyancy"),
     ]
+    _BASELINE_TOOLTIP = (
+        "Marks this element as the source of drysuit baseline lift in the inflation "
+        "gas calculation. Only one element per Buoyancy Plan should have this flag."
+    )
 
-    def __init__(self, parent, data: dict | None = None):
+    def __init__(self, parent, data: dict | None = None, db: dict | None = None):
         super().__init__(parent)
         self._is_edit = data is not None
         self.setWindowTitle("Edit Equipment" if self._is_edit else "Add Equipment")
         self.setMinimumWidth(680)
         self._data = copy.deepcopy(data) if data else {}
+        self._db   = db
         self._entries: dict[str, QLineEdit] = {}
         self._checks: dict[str, QCheckBox] = {}
         self._preview_labels: dict[str, QLabel] = {}
@@ -445,6 +463,8 @@ class EquipmentDialog(QDialog):
             cb = QCheckBox(label)
             cb.setChecked(bool(self._data.get(key, False)))
             cb.stateChanged.connect(self._recalc)
+            if key == "baseline_buoyancy":
+                cb.setToolTip(self._BASELINE_TOOLTIP)
             self._checks[key] = cb
             left_lay.addWidget(cb, r, 0, 1, 2)
             r += 1
@@ -542,6 +562,27 @@ class EquipmentDialog(QDialog):
         for label, key in self.CHECKS:
             self._data[key] = self._checks[key].isChecked()
         self._data["category"] = self._category()
+        if self._data.get("baseline_buoyancy") and self._db is not None:
+            current_name = self._data.get("name", "")
+            conflict = next(
+                (e["name"] for e in self._db.get("equipment", [])
+                 if e.get("baseline_buoyancy") and e.get("name") != current_name),
+                None,
+            ) or next(
+                (d["name"] for d in self._db.get("divers", [])
+                 if d.get("baseline_buoyancy") and d.get("name") != current_name),
+                None,
+            )
+            if conflict:
+                reply = QMessageBox.question(
+                    self, "Duplicate Baseline Buoyancy",
+                    f"'{conflict}' already has Baseline Buoyancy flagged.\n"
+                    "Continue and have two? (Multiple flags will cause a warning "
+                    "in the inflation model.)",
+                    QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
+                )
+                if reply != QMessageBox.StandardButton.Ok:
+                    return
         self.accept()
 
     def result_data(self) -> dict:
@@ -589,13 +630,18 @@ class DiverDialog(QDialog):
         ("Lead dry weight [kg]","lead_dry_mass", float),
         ("Diver dry mass [kg]", "diver_dry_mass",float),
     ]
+    _BASELINE_TOOLTIP = (
+        "Marks this element as the source of drysuit baseline lift in the inflation "
+        "gas calculation. Only one element per Buoyancy Plan should have this flag."
+    )
 
-    def __init__(self, parent, data: dict | None = None):
+    def __init__(self, parent, data: dict | None = None, db: dict | None = None):
         super().__init__(parent)
         self._is_edit = data is not None
         self.setWindowTitle("Edit Diver" if self._is_edit else "Add Diver")
         self.setMinimumWidth(620)
         self._data = copy.deepcopy(data) if data else {}
+        self._db   = db
         self._entries: dict[str, QLineEdit] = {}
         self._preview_labels: dict[str, QLabel] = {}
 
@@ -615,12 +661,19 @@ class DiverDialog(QDialog):
             self._entries[key] = le
             left_lay.addWidget(le, r, 1)
 
-        # Checkbox
+        r_cb = len(self.INPUT_FIELDS)
+        # Diver Buoyancy checkbox
         self._cb_diver = QCheckBox("Diver Buoyancy")
         cat = self._data.get("category", "") or ""
         self._cb_diver.setChecked("Diver Buoyancy" in cat)
         self._cb_diver.stateChanged.connect(self._recalc)
-        left_lay.addWidget(self._cb_diver, len(self.INPUT_FIELDS), 0, 1, 2)
+        left_lay.addWidget(self._cb_diver, r_cb, 0, 1, 2)
+
+        # Baseline Buoyancy checkbox
+        self._cb_baseline = QCheckBox("Baseline Buoyancy")
+        self._cb_baseline.setChecked(bool(self._data.get("baseline_buoyancy", False)))
+        self._cb_baseline.setToolTip(self._BASELINE_TOOLTIP)
+        left_lay.addWidget(self._cb_baseline, r_cb + 1, 0, 1, 2)
 
         # Buttons
         btn_lay = QHBoxLayout()
@@ -632,7 +685,7 @@ class DiverDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         btn_lay.addWidget(ok_btn)
         btn_lay.addWidget(cancel_btn)
-        left_lay.addLayout(btn_lay, len(self.INPUT_FIELDS) + 1, 0, 1, 2)
+        left_lay.addLayout(btn_lay, r_cb + 2, 0, 1, 2)
 
         # ── Right: calculated preview ─────────────────────────────────────────
         right_box = QGroupBox("Calculated preview")
@@ -690,7 +743,29 @@ class DiverDialog(QDialog):
                     QMessageBox.warning(self, "Invalid input",
                                         f"'{label}' must be a number.")
                     return
-        self._data["category"] = "Diver Buoyancy" if self._cb_diver.isChecked() else ""
+        self._data["category"]          = "Diver Buoyancy" if self._cb_diver.isChecked() else ""
+        self._data["baseline_buoyancy"] = self._cb_baseline.isChecked()
+        if self._data["baseline_buoyancy"] and self._db is not None:
+            current_name = self._data.get("name", "")
+            conflict = next(
+                (d["name"] for d in self._db.get("divers", [])
+                 if d.get("baseline_buoyancy") and d.get("name") != current_name),
+                None,
+            ) or next(
+                (e["name"] for e in self._db.get("equipment", [])
+                 if e.get("baseline_buoyancy") and e.get("name") != current_name),
+                None,
+            )
+            if conflict:
+                reply = QMessageBox.question(
+                    self, "Duplicate Baseline Buoyancy",
+                    f"'{conflict}' already has Baseline Buoyancy flagged.\n"
+                    "Continue and have two? (Multiple flags will cause a warning "
+                    "in the inflation model.)",
+                    QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
+                )
+                if reply != QMessageBox.StandardButton.Ok:
+                    return
         self.accept()
 
     def result_data(self) -> dict:
@@ -856,6 +931,7 @@ class EquipmentTable(_SectionTable):
         ("Modular",        60),
         ("Diver Buoy.",    80),
         ("Stage",          50),
+        ("Baseline",       65),
         ("Description",   200),
     ]
     TOOLBAR_COLOR = CLR_TOOLBAR_EQ
@@ -866,10 +942,11 @@ class EquipmentTable(_SectionTable):
         return [it.get("name",""), it.get("category",""),
                 it.get("dry_mass",""), it.get("wet_mass",""),
                 b("jj_core"), b("jj_modular"), b("diver_buoyancy"), b("stage"),
+                b("baseline_buoyancy"),
                 it.get("description","")]
 
     def _open_dialog(self, data):
-        return EquipmentDialog(self, data)
+        return EquipmentDialog(self, data, db=self._db)
 
 
 class DiverTable(_SectionTable):
@@ -878,16 +955,18 @@ class DiverTable(_SectionTable):
         ("Category",          140),
         ("Lead dry [kg]",     110),
         ("Diver dry [kg]",    110),
+        ("Baseline",           65),
     ]
     TOOLBAR_COLOR = CLR_TOOLBAR_DV
     ADD_LABEL = "+ Add Diver"
 
     def _to_row(self, it):
         return [it.get("name",""), it.get("category",""),
-                it.get("lead_dry_mass",""), it.get("diver_dry_mass","")]
+                it.get("lead_dry_mass",""), it.get("diver_dry_mass",""),
+                "✓" if it.get("baseline_buoyancy") else ""]
 
     def _open_dialog(self, data):
-        return DiverDialog(self, data)
+        return DiverDialog(self, data, db=self._db)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1177,6 +1256,13 @@ class _EquipRow(QWidget):
         self._cb.setFixedWidth(_COL_CB)
         lay.addWidget(self._cb)
 
+        self._star_lbl = QLabel("★")
+        self._star_lbl.setStyleSheet("color:#ffaa00; font-size:11px;")
+        self._star_lbl.setToolTip("Used as drysuit baseline lift in inflation gas calculation")
+        self._star_lbl.setFixedWidth(14)
+        self._star_lbl.hide()
+        lay.addWidget(self._star_lbl)
+
         self._dry_lbl = QLabel("---")
         self._dry_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._dry_lbl.setFrameShape(QFrame.Shape.StyledPanel)
@@ -1242,6 +1328,12 @@ class _EquipRow(QWidget):
         else:
             self._dry_lbl.setText("---")
             self._buoy_lbl.setText("---")
+
+        item = diver or equip
+        if item and item.get("baseline_buoyancy"):
+            self._star_lbl.show()
+        else:
+            self._star_lbl.hide()
 
         if self._on_change:
             self._on_change()
@@ -1768,6 +1860,7 @@ class MainWindow(QMainWindow):
         self.setMinimumWidth(1720)
 
         self._db = load_db()
+        migrate_baseline_buoyancy_flag(self._db)
 
         self._tabs = QTabWidget()
         self._tabs.setDocumentMode(True)

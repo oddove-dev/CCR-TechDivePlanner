@@ -493,7 +493,8 @@ class DivePlannerTab(QWidget):
     # ── Settings panel ────────────────────────────────────────────────────────
 
     # Settings field definitions (label, attr, default)
-    _SETTINGS_FIELDS = [
+    # General tab fields
+    _GENERAL_FIELDS = [
         ("Descend SP [bar]",   "_sp_desc",     "0.7"),
         ("Bottom SP [bar]",    "_sp",          "1.3"),
         ("Deco SP [bar]",      "_sp_deco",     "1.6"),
@@ -510,34 +511,57 @@ class DivePlannerTab(QWidget):
         ("Heatmap int [min]",  "_heatmap_int", "0.1"),
         ("Loop vol [L]",       "_ccr_loop_vol","7"),
         ("Metab O2 [L/min]",   "_ccr_o2_rate", "0.3"),
+    ]
+    # Gas Correction tab — correction factors and one-time events
+    _GAS_CORR_FIELDS = [
+        ("Diluent correction [%]",  "_dil_correction",  "50"),
+        ("O2 correction [%]",       "_o2_correction",   "50"),
+        ("Inflation correction [%]","_infl_correction", "50"),
+        ("Mask clear vol [L]",      "_mask_clear_vol",  "0.5"),
+        ("Deco loop refill [L]",    "_deco_refill_vol", "7.0"),
+    ]
+    # Gas Correction tab — drysuit/BCD sizing
+    _BUOYANCY_FIELDS = [
+        ("Drysuit extra capacity [kg]", "_drysuit_extra_cap", "3.0"),
+        ("BCD max capacity [kg]",       "_bcd_max_cap",       "15.0"),
+    ]
+    # Combined list used by save/load (includes deprecated Gas Correction tab fields)
+    _SETTINGS_FIELDS = _GENERAL_FIELDS + _GAS_CORR_FIELDS + _BUOYANCY_FIELDS + [
         ("Drysuit vol [L]",    "_ccr_suit_vol","4"),
     ]
 
     def _build_settings(self):
-        """Build settings widget. Returns the QGroupBox."""
+        """Build settings widget with General/Gas Correction tabs. Returns the QGroupBox."""
         box = QGroupBox("Settings")
-        box.setFixedWidth(560)
+        box.setMinimumWidth(480)
         box.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding)
 
-        grid = QGridLayout(box)
-        grid.setContentsMargins(10, 10, 10, 10)
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(4)
+        outer = QVBoxLayout(box)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(4)
 
-        half = (len(self._SETTINGS_FIELDS) + 1) // 2
+        tabs = QTabWidget()
+        outer.addWidget(tabs)
 
-        # 5 columns: 0=left-label 1=left-entry 2=separator 3=right-label 4=right-entry
+        # ── General tab ──────────────────────────────────────────────────────
+        gen_w    = QWidget()
+        gen_grid = QGridLayout(gen_w)
+        gen_grid.setContentsMargins(8, 8, 8, 8)
+        gen_grid.setHorizontalSpacing(10)
+        gen_grid.setVerticalSpacing(4)
+
+        half = (len(self._GENERAL_FIELDS) + 1) // 2   # 8 rows per column
+
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setStyleSheet("color:#cccccc;")
-        grid.addWidget(sep, 0, 2, half, 1)
-        grid.setColumnMinimumWidth(2, 8)
+        gen_grid.addWidget(sep, 0, 2, half, 1)
+        gen_grid.setColumnMinimumWidth(2, 8)
 
-        for i, (label, attr, default) in enumerate(self._SETTINGS_FIELDS):
-            if i < half:
-                row, col_lbl, col_ent = i, 0, 1
-            else:
-                row, col_lbl, col_ent = i - half, 3, 4
+        for i, (label, attr, default) in enumerate(self._GENERAL_FIELDS):
+            row      = i if i < half else i - half
+            col_lbl  = 0 if i < half else 3
+            col_ent  = 1 if i < half else 4
 
             lbl = QLabel(label + ":")
             le  = QLineEdit(default)
@@ -547,17 +571,25 @@ class DivePlannerTab(QWidget):
             setattr(self, attr + "_le", le)
             le.textChanged.connect(self._on_input_change)
 
-            grid.addWidget(lbl, row, col_lbl, Qt.AlignmentFlag.AlignLeft)
-            grid.addWidget(le,  row, col_ent, Qt.AlignmentFlag.AlignRight)
+            gen_grid.addWidget(lbl, row, col_lbl, Qt.AlignmentFlag.AlignLeft)
+            gen_grid.addWidget(le,  row, col_ent, Qt.AlignmentFlag.AlignRight)
 
-        # Save button row at bottom
+        tabs.addTab(gen_w, "General")
+
+        # ── Gas Correction tab ───────────────────────────────────────────────
+        tabs.addTab(self._build_gas_correction_tab(), "Gas Correction")
+
+        # ── Save button row (below tabs) ─────────────────────────────────────
+        btn_row = QHBoxLayout()
         self._settings_status_lbl = QLabel("")
         self._settings_status_lbl.setStyleSheet("color:#44cc88; font-size:9px;")
         save_btn = QPushButton("Save settings")
         save_btn.setStyleSheet("background:#2a5a2a; color:white; font-weight:bold; padding:3px 8px;")
         save_btn.clicked.connect(self._save_global_settings)
-        grid.addWidget(self._settings_status_lbl, half, 0, 1, 2, Qt.AlignmentFlag.AlignRight)
-        grid.addWidget(save_btn, half, 3, 1, 2)
+        btn_row.addStretch()
+        btn_row.addWidget(self._settings_status_lbl)
+        btn_row.addWidget(save_btn)
+        outer.addLayout(btn_row)
 
         return box
 
@@ -580,6 +612,61 @@ class DivePlannerTab(QWidget):
             le = getattr(self, attr + "_le", None)
             if le:
                 le.setText(gs.get(attr, default))
+
+    # ── Gas Correction tab helpers ────────────────────────────────────────────
+
+    def _build_gas_correction_tab(self) -> QWidget:
+        """Build Gas Correction tab using the same pattern as the General tab."""
+        # Left column: gas correction factors + events (5 fields)
+        # Right column: drysuit/BCD sizing (3 fields)
+        left_fields  = self._GAS_CORR_FIELDS
+        right_fields = list(self._BUOYANCY_FIELDS) + [
+            ("Drysuit vol [L]", "_ccr_suit_vol", "4"),
+        ]
+        all_fields = list(left_fields) + right_fields
+        half       = len(left_fields)   # 5 — rows in left column
+
+        gc_w    = QWidget()
+        gc_grid = QGridLayout(gc_w)
+        gc_grid.setContentsMargins(8, 8, 8, 8)
+        gc_grid.setHorizontalSpacing(10)
+        gc_grid.setVerticalSpacing(4)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet("color:#cccccc;")
+        gc_grid.addWidget(sep, 0, 2, half, 1)
+        gc_grid.setColumnMinimumWidth(2, 8)
+
+        for i, (label, attr, default) in enumerate(all_fields):
+            row     = i if i < half else i - half
+            col_lbl = 0 if i < half else 3
+            col_ent = 1 if i < half else 4
+            deprecated = (attr == "_ccr_suit_vol")
+
+            lbl = QLabel(label + ":")
+            le  = QLineEdit(default)
+            le.setFixedWidth(60)
+            le.setAlignment(Qt.AlignmentFlag.AlignRight)
+            if deprecated:
+                lbl.setStyleSheet("color:#888888;")
+                le.setStyleSheet(f"background:{CLR_INPUT}; color:#888888;")
+            else:
+                le.setStyleSheet(f"background:{CLR_INPUT};")
+            setattr(self, attr + "_le", le)
+            le.textChanged.connect(self._on_input_change)
+
+            gc_grid.addWidget(lbl, row, col_lbl, Qt.AlignmentFlag.AlignLeft)
+            gc_grid.addWidget(le,  row, col_ent, Qt.AlignmentFlag.AlignRight)
+
+        # Info row spanning full width below both columns
+        self._drysuit_baseline_lbl = QLabel("Drysuit baseline lift: —")
+        self._drysuit_baseline_lbl.setStyleSheet("color:#888888;")
+        gc_grid.addWidget(self._drysuit_baseline_lbl, half, 0, 1, 5,
+                          Qt.AlignmentFlag.AlignLeft)
+        gc_grid.setRowStretch(half + 1, 1)
+
+        return gc_w
 
     # ── CCR Tissue Saturations panel ──────────────────────────────────────────
 
@@ -1079,13 +1166,17 @@ class DivePlannerTab(QWidget):
         hdr_l.addStretch()
         vl.addWidget(hdr_w)
 
-        self._onboard_cbs  = []
-        self._onboard_info = []   # list of (name_lbl, pres_lbl, mix_lbl) per row
+        self._onboard_cbs      = []
+        self._onboard_info     = []   # list of (name_lbl, pres_lbl, mix_lbl) per row
+        self._onboard_row_ws   = []   # row container widgets (for show/hide)
+        self._onboard_role_lbl = []   # role QLabel widgets (for combined text)
+
+        _ROLE_TEXTS = ("Diluent gas:", "Oxygen:", "Inflation gas:", "BCD gas:")
 
         def _cyl_opts():
             return ["Cylinder 1", "Cylinder 2", "Cylinder 3", "Cylinder 4"]
 
-        for i, role_txt in enumerate(("Diluent gas:", "Oxygen:", "Inflation gas:", "BCD gas:")):
+        for i, role_txt in enumerate(_ROLE_TEXTS):
             row_w = QWidget()
             rl    = QHBoxLayout(row_w)
             rl.setContentsMargins(2, 1, 2, 1)
@@ -1118,8 +1209,12 @@ class DivePlannerTab(QWidget):
 
             self._onboard_cbs.append(cb)
             self._onboard_info.append((name_lbl, pres_lbl, mix_lbl))
+            self._onboard_row_ws.append(row_w)
+            self._onboard_role_lbl.append(role_lbl)
 
         self._onboard_cbs[0].currentTextChanged.connect(self._on_dil_cyl_change)
+        for cb in self._onboard_cbs[2:]:           # Inflation + BCD share same source check
+            cb.currentTextChanged.connect(self._refresh_onboard_row_visibility)
         vl.addStretch()
 
         # ── Tabbed area (Onboard Gas + charts) ──────────────────────────────
@@ -1557,12 +1652,12 @@ class DivePlannerTab(QWidget):
             base_cols=[("Depth / Label", 130, "w"), ("Stop", 50, "e"),
                        ("Runtime", 62, "e"), ("SP", 60, "w"),
                        ("Gas", 78, "w")],
-            extra_cols=[("Dil[bar]", 55, "e"), ("Dil[L]", 45, "e"),
-                        ("O2[bar]",  55, "e"), ("O2[L]",  45, "e"),
-                        ("Infl[bar]", 60, "e"), ("Infl[L]", 45, "e"),
-                        ("BCD[bar]", 60, "e"), ("BCD[L]", 45, "e"),
+            extra_cols=[("Dil[bar]", 55, "e"),
+                        ("O2[bar]",  55, "e"),
+                        ("Infl[bar]", 60, "e"),
+                        ("BCD[bar]", 60, "e"),
                         ("Buoyancy[kg]", 95, "e"),
-                        ("Loop O2%", 60, "e"), ("Loop He%", 55, "e")],
+                        ("Loop O2/He", 80, "e")],
         )
 
         hbox_layout.addWidget(box, 0)
@@ -1585,7 +1680,7 @@ class DivePlannerTab(QWidget):
             base_cols=[("Depth / Label", 130, "w"), ("Stop", 50, "e"),
                        ("Runtime", 62, "e"), ("Gas", 95, "w")],
             extra_cols=[("PO2[bar]", 65, "e"), ("Press[bar]", 75, "e"),
-                        ("Used[L]", 70, "e"), ("Remain[L]", 80, "e"),
+                        ("Used[bar]", 70, "e"),
                         ("Buoyancy[kg]", 95, "e"), ("m/drop[kg]", 85, "e")],
         )
 
@@ -1668,38 +1763,109 @@ class DivePlannerTab(QWidget):
             self._dil_o2 = "—"
             self._dil_he = "—"
 
-    def _sync_suit_vol_from_plan(self, plan_name: str):
-        """Auto-populate CCR drysuit volume from the diver buoyancy in the selected plan."""
-        le = getattr(self, "_ccr_suit_vol_le", None)
-        if le is None:
-            return
+    def _get_drysuit_baseline_lift(self, plan_name: str) -> tuple[float, str]:
+        """Return (baseline_lift_kg, item_name) for the active plan.
+
+        Finds the eslot whose DB record has baseline_buoyancy=True and reads its
+        Buoy SW via the same _compute_diver / _compute_equip path the UI uses.
+        Expects exactly one such item; logs a warning if zero or more than one.
+        """
+        from main_qt import _compute_diver, _compute_equip
+        import warnings
         user = self._bp_tab._current_user()
         plan_state = None
         if plan_name and plan_name != "—" and user in self._db.get("users", {}):
             plan_state = (self._db["users"][user]
                           .get("buoyancy_plans", {}).get(plan_name))
         if not plan_state:
-            return
-        eslots = plan_state.get("eslots", [])
-        diver_name = eslots[0].get("sel", "—") if eslots else "—"
-        if not diver_name or diver_name == "—":
-            return
-        diver = next((d for d in self._db.get("divers", [])
-                      if d.get("name") == diver_name), None)
-        if diver is None:
-            return
-        lead_dry = float(diver.get("lead_dry_mass") or 0)
-        if lead_dry <= 0:
-            return
-        v_lead      = lead_dry / RHO_PB
-        buoy_sw_kg  = lead_dry - v_lead * RHO_SW   # diver_buoyancy_sw
-        suit_vol_L  = buoy_sw_kg / RHO_SW
-        if suit_vol_L > 0:
+            return 0.0, ""
+
+        matches: list[tuple[float, str]] = []
+        for slot in plan_state.get("eslots", []):
+            item_name = slot.get("sel", "—")
+            if not item_name or item_name == "—":
+                continue
+            diver = next((d for d in self._db.get("divers", [])
+                          if d.get("name") == item_name), None)
+            equip = None if diver else next(
+                (e for e in self._db.get("equipment", [])
+                 if e.get("name") == item_name), None)
+            item = diver or equip
+            if not item or not item.get("baseline_buoyancy"):
+                continue
+            if diver:
+                lead = float(diver.get("lead_dry_mass") or 0)
+                if lead <= 0:
+                    warnings.warn(f"Baseline diver '{item_name}' has no lead_dry_mass")
+                    continue
+                r = _compute_diver(lead, diver.get("diver_dry_mass"))
+                buoy_sw = r["diver_buoyancy_sw"]
+            else:
+                dry = float(equip.get("dry_mass") or 0)
+                wet = float(equip.get("wet_mass") or 0)
+                r = _compute_equip(dry, wet)
+                buoy_sw = r["buoyancy_sw"]
+            if buoy_sw > 0:
+                matches.append((buoy_sw, item_name))
+
+        if not matches:
+            warnings.warn(f"No element with baseline_buoyancy=True in plan '{plan_name}'")
+            return 0.0, "—"
+        if len(matches) > 1:
+            warnings.warn(f"Multiple baseline_buoyancy elements in plan '{plan_name}': "
+                          f"{[n for _, n in matches]}")
+        return matches[0]
+
+    def _sync_suit_vol_from_plan(self, plan_name: str):
+        """Auto-populate deprecated drysuit vol field and update baseline-lift info label."""
+        buoy_sw_kg, diver_name = self._get_drysuit_baseline_lift(plan_name)
+
+        # Update deprecated Drysuit vol [L] field (backward-compat)
+        le = getattr(self, "_ccr_suit_vol_le", None)
+        if le is not None and buoy_sw_kg > 0:
+            suit_vol_L = buoy_sw_kg / RHO_SW
             le.setText(f"{suit_vol_L:.1f}")
+
+        # Update Gas Correction tab info label (combined prefix + value)
+        info_lbl = getattr(self, "_drysuit_baseline_lbl", None)
+        if info_lbl is not None:
+            if buoy_sw_kg > 0 and diver_name:
+                info_lbl.setText(
+                    f"Drysuit baseline lift: {buoy_sw_kg:.2f} kg  "
+                    f"(plan: {plan_name}, diver: {diver_name})"
+                )
+                info_lbl.setStyleSheet("color:#ccc; font-size:11px; padding:8px 4px;")
+            else:
+                info_lbl.setText("Drysuit baseline lift: —")
+                info_lbl.setStyleSheet("color:#777; font-size:11px; padding:8px 4px;")
+
+    def _refresh_onboard_row_visibility(self, *_):
+        """Dim BCD name/press/mix labels and show '(shared)' when BCD shares a cylinder
+        with Inflation.  BCD row stays visible as an empty slot placeholder."""
+        if len(self._onboard_cbs) < 4 or not self._onboard_info:
+            return
+        infl_src = self._onboard_cbs[2].currentText()
+        bcd_src  = self._onboard_cbs[3].currentText()
+        self._bcd_shared = (bool(infl_src) and bool(bcd_src) and infl_src == bcd_src)
+        name_lbl, pres_lbl, mix_lbl = self._onboard_info[3]
+        if self._bcd_shared:
+            name_lbl.setText("(shared)")
+            pres_lbl.setText("—")
+            mix_lbl.setText("—")
+            dim = "color:#888888;"
+            for lbl in (name_lbl, pres_lbl, mix_lbl):
+                lbl.setStyleSheet(dim)
+        else:
+            for lbl in (name_lbl, pres_lbl, mix_lbl):
+                lbl.setStyleSheet("")
 
     def _update_onboard_info(self, plan_state_bp):
         """Fill Name/Press/Mix labels in the Onboard Gas tab from the buoyancy plan."""
+        self._refresh_onboard_row_visibility()
+        bcd_shared = getattr(self, "_bcd_shared", False)
         for i, (name_lbl, pres_lbl, mix_lbl) in enumerate(self._onboard_info):
+            if i == 3 and bcd_shared:
+                continue   # labels already set to "(shared)" by _refresh_onboard_row_visibility
             cb_txt = self._onboard_cbs[i].currentText()
             name_lbl.setText("—"); pres_lbl.setText("—"); mix_lbl.setText("—")
             if not plan_state_bp:
@@ -2206,6 +2372,87 @@ class DivePlannerTab(QWidget):
             sp.set_edgecolor("#2a2a4a")
         self._tissue_canvas.draw()
 
+    @staticmethod
+    def _render_gas_bars(ax, data, role_labels, title, max_init=None):
+        """Shared renderer for BO and CCR gas consumption charts.
+
+        Dark background = total capacity.  Coloured fill = remaining gas.
+        Labels: used bar in dark zone, remaining bar inside coloured fill.
+        """
+        def _remain_col(remain, init):
+            if init <= 0: return "#445566"
+            p = remain / init
+            if p >= 0.33: return "#44cc66"   # green  — rule-of-thirds safe
+            if p >= 0.20: return "#ddaa22"   # yellow — low margin
+            return               "#cc3333"   # red    — below reserve
+
+        bar_w = 0.6
+        if max_init is None:
+            max_init = max((d.get("initial_bar", 0) for d in data), default=1.0)
+        if max_init <= 0:
+            max_init = 1.0
+
+        for i, d in enumerate(data):
+            init      = d.get("initial_bar", 0.0)
+            used      = d.get("used_bar",    0.0)
+            remain    = max(0.0, init - used)
+            gas_lbl   = d.get("label", "")
+            role      = role_labels[i]
+            is_shared = d.get("is_shared", False)
+
+            # Dark background = total capacity (always drawn)
+            ax.bar(i, max(init, max_init * 0.04), width=bar_w,
+                   color="#22224a", edgecolor="#3a3a6a", linewidth=0.6, zorder=2)
+
+            if is_shared:
+                # Empty placeholder — dark bar only, no fill, no labels
+                ax.text(i, max_init * 0.5, "(shared)", ha="center", va="center",
+                        color="#445566", fontsize=6.5, style="italic", zorder=4)
+            elif init > 0:
+                col = _remain_col(remain, init)
+                ax.bar(i, remain, width=bar_w, color=col, alpha=0.88, zorder=3)
+
+                if used >= 1.0:
+                    dark_mid = remain + used / 2.0
+                    ax.text(i, dark_mid, f"{used:.0f} bar",
+                            ha="center", va="center", color="#e0e0e0",
+                            fontsize=6.5, zorder=4)
+
+                MIN_LABEL_HEIGHT = max_init * 0.10
+                if remain >= MIN_LABEL_HEIGHT:
+                    ax.text(i, remain / 2.0, f"{remain:.0f} bar",
+                            ha="center", va="center", color="#0a2e1f",
+                            fontsize=6.5, fontweight="bold", zorder=4)
+                else:
+                    ax.text(i, remain + max_init * 0.03, f"{remain:.0f} bar",
+                            ha="center", va="bottom", color=col,
+                            fontsize=6.5, fontweight="bold", zorder=4)
+            else:
+                ax.text(i, max_init * 0.06, "—", ha="center", va="bottom",
+                        color="#445566", fontsize=9)
+
+            cyl_vol = d.get("cyl_vol", 0.0)
+            max_bar = d.get("max_bar", init)
+            if is_shared:
+                tick_lbl = f"{role}\n(shared)"
+            else:
+                lines = [role]
+                if gas_lbl:   lines.append(gas_lbl)
+                if cyl_vol > 0 and max_bar > 0:
+                    lines.append(f"{cyl_vol:g}L @ {max_bar:.0f} bar")
+                tick_lbl = "\n".join(lines)
+            ax.text(i, -max_init * 0.15, tick_lbl, ha="center", va="top",
+                    color="#99aacc", fontsize=6.5, transform=ax.transData)
+
+        ax.set_xticks([])
+        ax.set_ylim(-max_init * 0.05, max_init * 1.20)
+        ax.set_ylabel("bar", fontsize=7, color="#99aacc")
+        ax.tick_params(labelsize=7, colors="#99aacc")
+        ax.set_title(title, fontsize=8, color="#aabbdd", pad=3)
+        ax.grid(True, axis="y", color="#1e1e3a", linewidth=0.5, linestyle=":")
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#2a2a4a")
+
     def _draw_gas_chart(self):
         if self._gas_canvas is None:
             return
@@ -2213,51 +2460,10 @@ class DivePlannerTab(QWidget):
         fig.clear()
         ax = fig.add_subplot(111)
         ax.set_facecolor("#12122a")
-
-        COLS = ["#4a90d9", "#e04040", "#50c060", "#f0a030"]
-        _role_labels = ["Bailout gas", "Interstage gas", "Deco gas 1", "Deco gas 2"]
-
-        # Pad/trim to always exactly 4 slots
-        data = (self._bail_gas_chart_data + [{} ] * 4)[:4]
-        xs   = list(range(4))
-        bar_w = 0.6
-        max_init = max((d.get("initial_L", 0) for d in data), default=1.0)
-        if max_init == 0:
-            max_init = 1.0
-
-        for i, (d, col) in enumerate(zip(data, COLS)):
-            init    = d.get("initial_L", 0.0)
-            used    = d.get("used_L",    0.0)
-            gas_lbl = d.get("label", "")
-            role    = _role_labels[i]
-
-            # Background bar (capacity) — always drawn
-            ax.bar(i, max(init, max_init * 0.04), width=bar_w,
-                   color="#22224a", edgecolor="#3a3a6a", linewidth=0.6, zorder=2)
-
-            if init > 0:
-                ax.bar(i, used, width=bar_w, color=col, alpha=0.85, zorder=3)
-                pct = used / init * 100
-                ax.text(i, used + max_init * 0.03, f"{pct:.0f}%",
-                        ha="center", va="bottom", color=col,
-                        fontsize=7, fontweight="bold")
-            else:
-                ax.text(i, max_init * 0.06, "—", ha="center", va="bottom",
-                        color="#445566", fontsize=9)
-
-            # Two-line x-label: role on top, gas name below
-            tick_lbl = f"{role}\n{gas_lbl}" if gas_lbl else role
-            ax.text(i, -max_init * 0.12, tick_lbl, ha="center", va="top",
-                    color="#99aacc", fontsize=6.5, transform=ax.transData)
-
-        ax.set_xticks([])
-        ax.set_ylim(-max_init * 0.05, max_init * 1.18)
-        ax.set_ylabel("L", fontsize=7, color="#99aacc")
-        ax.tick_params(labelsize=7, colors="#99aacc")
-        ax.set_title("BO Gas consumption  (Bailout OC)", fontsize=8, color="#aabbdd", pad=3)
-        ax.grid(True, axis="y", color="#1e1e3a", linewidth=0.5, linestyle=":")
-        for sp in ax.spines.values():
-            sp.set_edgecolor("#2a2a4a")
+        data = (self._bail_gas_chart_data + [{}] * 4)[:4]
+        self._render_gas_bars(ax, data,
+                              ["Bailout gas", "Interstage gas", "Deco gas 1", "Deco gas 2"],
+                              "Bailout consumption")
         self._gas_canvas.draw()
 
     def _draw_ccr_gas_chart(self):
@@ -2268,46 +2474,10 @@ class DivePlannerTab(QWidget):
         ax = fig.add_subplot(111)
         ax.set_facecolor("#12122a")
 
-        COLS       = ["#4a90d9", "#e04040", "#50c060", "#f0a030"]
-        role_labels = ["Diluent", "O2 (pure)", "Inflation gas", "BCD gas"]
-
-        data  = (self._ccr_gas_chart_data + [{}] * 4)[:4]
-        bar_w = 0.6
-        max_init = max((d.get("initial_L", 0) for d in data), default=1.0)
-        if max_init == 0:
-            max_init = 1.0
-
-        for i, (d, col) in enumerate(zip(data, COLS)):
-            init    = d.get("initial_L", 0.0)
-            used    = d.get("used_L",    0.0)
-            gas_lbl = d.get("label", "")
-            role    = role_labels[i]
-
-            ax.bar(i, max(init, max_init * 0.04), width=bar_w,
-                   color="#22224a", edgecolor="#3a3a6a", linewidth=0.6, zorder=2)
-
-            if init > 0:
-                ax.bar(i, min(used, init), width=bar_w, color=col, alpha=0.85, zorder=3)
-                pct = used / init * 100
-                ax.text(i, min(used, init) + max_init * 0.03, f"{pct:.0f}%",
-                        ha="center", va="bottom", color=col,
-                        fontsize=7, fontweight="bold")
-            else:
-                ax.text(i, max_init * 0.06, "—", ha="center", va="bottom",
-                        color="#445566", fontsize=9)
-
-            tick_lbl = f"{role}\n{gas_lbl}" if gas_lbl else role
-            ax.text(i, -max_init * 0.12, tick_lbl, ha="center", va="top",
-                    color="#99aacc", fontsize=6.5, transform=ax.transData)
-
-        ax.set_xticks([])
-        ax.set_ylim(-max_init * 0.05, max_init * 1.18)
-        ax.set_ylabel("L", fontsize=7, color="#99aacc")
-        ax.tick_params(labelsize=7, colors="#99aacc")
-        ax.set_title("CCR Gas consumption", fontsize=8, color="#aabbdd", pad=3)
-        ax.grid(True, axis="y", color="#1e1e3a", linewidth=0.5, linestyle=":")
-        for sp in ax.spines.values():
-            sp.set_edgecolor("#2a2a4a")
+        data = (self._ccr_gas_chart_data + [{}] * 4)[:4]
+        self._render_gas_bars(ax, data,
+                              ["Diluent", "O2 (pure)", "Inflation gas", "BCD gas"],
+                              "CCR consumption")
         self._ccr_gas_canvas.draw()
 
     def _open_tissue_window(self, surface_mv=True, bailout=False, tab=0):
@@ -2663,10 +2833,10 @@ class DivePlannerTab(QWidget):
             result = None
 
         # ── Onboard gas volumes ──────────────────────────────────────────────
-        onboard_pres, onboard_vols = [], []
+        onboard_pres, onboard_vols, onboard_cylvols = [], [], []
         for cb in self._onboard_cbs:
             label = cb.currentText()
-            pres_v, vol_v = "—", "—"
+            pres_v, vol_v, cylvol_v = "—", "—", 0.0
             if plan_state_bp:
                 try:
                     idx = int(label.split()[-1]) - 1
@@ -2680,12 +2850,14 @@ class DivePlannerTab(QWidget):
                             hei  = _int_val(s.get("he", "0"))
                             Z    = z_mix(pres + 1.0, T_c + 273.15, o2i, hei)
                             rg   = float(cyl.get("volume_bottle", 0)) * (pres + 1.0) / Z
-                            pres_v = f"{pres:.0f}"
-                            vol_v  = f"{rg:.0f}"
+                            pres_v   = f"{pres:.0f}"
+                            vol_v    = f"{rg:.0f}"
+                            cylvol_v = float(cyl.get("volume_bottle", 0))
                 except Exception:
                     pass
             onboard_pres.append(pres_v)
             onboard_vols.append(vol_v)
+            onboard_cylvols.append(cylvol_v)
 
         try:
             ccr_buoy = float(self._bp_tab._sum_lbls["jj_diver_stages"].text())
@@ -2696,59 +2868,171 @@ class DivePlannerTab(QWidget):
 
         self._update_onboard_info(plan_state_bp)
 
-        dil_v, o2_v, infl_v, bcd_v = (onboard_vols + ["—", "—", "—", "—"])[:4]
-        dil_p, o2_p, infl_p, bcd_p = (onboard_pres + ["—", "—", "—", "—"])[:4]
+        dil_v, o2_v, infl_v, bcd_v       = (onboard_vols    + ["—", "—", "—", "—"])[:4]
+        dil_p, o2_p, infl_p, bcd_p       = (onboard_pres    + ["—", "—", "—", "—"])[:4]
+        dil_cv, o2_cv, infl_cv, bcd_cv   = (onboard_cylvols + [0.0, 0.0, 0.0, 0.0])[:4]
         dil_mix       = ccr.dil_label()
         sp_bottom_lbl = ccr.sp_label(sp=ccr.setpoint)
         sp_desc_lbl   = ccr.sp_label(sp=ccr.sp_descend)
         sp_deco_lbl   = ccr.sp_label(sp=ccr.sp_deco) if hasattr(ccr, "sp_deco") else sp_bottom_lbl
 
+        # CCR gas settings needed for per-row consumption tracking
+        V_loop   = self._get_setting("_ccr_loop_vol",  7.0)
+        o2_rate  = self._get_setting("_ccr_o2_rate",   0.3)
+        V_suit   = self._get_setting("_ccr_suit_vol",  4.0)
+
+        # Running cylinder pressures — decremented as each row is built
+        def _fp(s):
+            try: return float(str(s).strip())
+            except: return 0.0
+
+        _rp = {"dil": _fp(dil_p), "o2": _fp(o2_p), "infl": _fp(infl_p), "bcd": _fp(bcd_p)}
+
+        _plan_name_for_lift  = self._stage_plan_cb.currentText()
+        _baseline_lift_kg, _ = self._get_drysuit_baseline_lift(_plan_name_for_lift)
+        _extra_cap_kg        = self._get_setting("_drysuit_extra_cap", 3.0)
+        _bcd_is_shared       = getattr(self, "_bcd_shared", False)
+
+        # ── Per-row dynamic buoyancy tracking ────────────────────────────────
+        # Build cylinder info list: (rp_key, vbot, o2i, hei, temp, p_initial)
+        # This allows computing gas mass consumed per cylinder via calc_gas_mass delta.
+        _rp_keys   = ["dil", "o2", "infl", "bcd"]
+        _ccr_cyl_info: list[tuple] = []
+        if plan_state_bp:
+            for _k, _cb in enumerate(self._onboard_cbs[:4]):
+                try:
+                    _idx = int(_cb.currentText().split()[-1]) - 1
+                    _js  = plan_state_bp.get("jslots", [])
+                    if _idx < len(_js):
+                        _sl  = _js[_idx]
+                        _cyl = _find_cyl(self._db, _sl.get("sel", ""))
+                        if _cyl:
+                            _vbot     = float(_cyl.get("volume_bottle", 0))
+                            _temp_cyl = float(_cyl.get("temp", T_c))
+                            _o2i      = _int_val(_sl.get("o2", "21"))
+                            _hei      = _int_val(_sl.get("he", "0"))
+                            _p0       = _fp(onboard_pres[_k]) if _k < len(onboard_pres) else 0.0
+                            _ccr_cyl_info.append((_rp_keys[_k], _vbot, _o2i, _hei, _temp_cyl, _p0))
+                except Exception:
+                    pass
+        # If BCD shares a cylinder with inflation, drop bcd to avoid double-counting
+        if _bcd_is_shared:
+            _ccr_cyl_info = [e for e in _ccr_cyl_info if e[0] != "bcd"]
+
+        def _ccr_buoy_running() -> str:
+            """Return current total buoyancy string, accounting for gas consumed so far."""
+            if ccr_buoy is None:
+                return "—"
+            delta = 0.0
+            for rk, vbot, o2i, hei, temp_cyl, p0 in _ccr_cyl_info:
+                if vbot <= 0:
+                    continue
+                p_now = _rp[rk]
+                try:
+                    gm0 = calc_gas_mass(vbot, p0,    temp_cyl, o2i, hei) if p0    > 0 else 0.0
+                    gmn = calc_gas_mass(vbot, p_now, temp_cyl, o2i, hei) if p_now > 0 else 0.0
+                    delta += gm0 - gmn   # mass consumed → positive, cylinder lighter → more buoyant
+                except Exception:
+                    pass
+            return f"{ccr_buoy + delta:+.2f}"
+
+        _dil_factor      = 1.0 + self._get_setting("_dil_correction",  50.0) / 100.0
+        _o2_factor       = 1.0 + self._get_setting("_o2_correction",   50.0) / 100.0
+        _infl_factor     = 1.0 + self._get_setting("_infl_correction", 50.0) / 100.0
+        _mask_clear_vol  = self._get_setting("_mask_clear_vol",  0.5)
+        _deco_refill_vol = self._get_setting("_deco_refill_vol", 7.0)
+        _max_plan_depth  = max((d for d, _ in segments), default=0.0) if segments else 0.0
+
+        _once = {"mask_clear": False, "deco_refill": False}
+
+        def _apply_mask_clear():
+            if _once["mask_clear"]:
+                return
+            _once["mask_clear"] = True
+            p_max  = P_SURF + _max_plan_depth * WATER_DENSITY / 10.0
+            used_L = _mask_clear_vol * p_max
+            if dil_cv > 0:
+                _rp["dil"] = max(0.0, _rp["dil"] - used_L / dil_cv)
+
+        def _apply_deco_refill():
+            if _once["deco_refill"]:
+                return
+            _once["deco_refill"] = True
+            if o2_cv > 0:
+                _rp["o2"] = max(0.0, _rp["o2"] - _deco_refill_vol / o2_cv)
+
+        def _consume_ccr(time_min, from_depth, to_depth, row_buoy_kg=None):
+            """Deduct gas for a segment from running cylinder pressures."""
+            # O2: metabolic throughout, with real-world correction factor
+            if o2_cv > 0:
+                _rp["o2"] = max(0.0, _rp["o2"] - o2_rate * time_min * _o2_factor / o2_cv)
+            if to_depth > from_depth:
+                p_from  = P_SURF + from_depth * WATER_DENSITY / 10.0
+                p_to    = P_SURF + to_depth   * WATER_DENSITY / 10.0
+                delta_p = p_to - p_from
+                # Diluent: Boyle loop fill on descent, with correction factor
+                if dil_cv > 0:
+                    _rp["dil"] = max(0.0, _rp["dil"] - V_loop * delta_p * _dil_factor / dil_cv)
+                # Inflation/BCD: Boyle compensation with baseline+extra model, with correction
+                buoy_kg          = row_buoy_kg if row_buoy_kg is not None else (ccr_buoy or 0.0)
+                required_extra   = max(0.0, -buoy_kg)
+                drysuit_extra_kg = min(required_extra, _extra_cap_kg)
+                bcd_lift_kg      = required_extra - drysuit_extra_kg
+                drysuit_total_kg = _baseline_lift_kg + drysuit_extra_kg
+                drysuit_gas_L    = (drysuit_total_kg / WATER_DENSITY) * delta_p * _infl_factor
+                bcd_gas_L        = (bcd_lift_kg      / WATER_DENSITY) * delta_p * _infl_factor
+                if _bcd_is_shared:
+                    if infl_cv > 0:
+                        _rp["infl"] = max(0.0, _rp["infl"] - (drysuit_gas_L + bcd_gas_L) / infl_cv)
+                        _rp["bcd"]  = _rp["infl"]
+                else:
+                    if infl_cv > 0:
+                        _rp["infl"] = max(0.0, _rp["infl"] - drysuit_gas_L / infl_cv)
+                    if bcd_cv > 0:
+                        _rp["bcd"]  = max(0.0, _rp["bcd"]  - bcd_gas_L     / bcd_cv)
+
         def _onboard_extra(sp_label="", sp_value=None, depth=0.0):
-            # Compute loop gas composition at this row's depth and setpoint
-            p_amb = P_SURF + depth * WATER_DENSITY / 10.0
-            dil_fo2 = ccr.diluent_o2          # fraction (0-1)
+            p_amb   = P_SURF + depth * WATER_DENSITY / 10.0
+            dil_fo2 = ccr.diluent_o2
             dil_fhe = ccr.diluent_he
-            dil_fin = 1.0 - dil_fo2 - dil_fhe  # inert (N2+He)
+            # Total inert fraction of diluent (He + N2) — correct denominator
+            dil_fin_total = max(1.0 - dil_fo2, 1e-9)
             if sp_value is None or sp_value <= 0 or p_amb <= 0:
-                # Descent: loop = diluent composition
                 loop_fo2 = dil_fo2
                 loop_fhe = dil_fhe
             else:
                 loop_fo2 = min(sp_value / p_amb, 1.0)
-                remaining = 1.0 - loop_fo2
-                if dil_fin > 0 and dil_fhe > 0:
-                    loop_fhe = remaining * (dil_fhe / dil_fin)
-                else:
-                    loop_fhe = 0.0
-            lo2_str = f"{loop_fo2*100:.0f}%"
-            lhe_str = f"{loop_fhe*100:.0f}%" if dil_fhe > 0 else "—"
+                # He fraction: inert budget × He share of diluent inerts
+                loop_fhe = (1.0 - loop_fo2) * (dil_fhe / dil_fin_total)
+            o2_pct = round(loop_fo2 * 100)
+            he_pct = round(loop_fhe * 100)
+            loop_str = f"{o2_pct}/{he_pct}" if dil_fhe > 0 else f"{o2_pct}"
+            dil_str  = f"{_rp['dil']:.0f}"  if _rp["dil"]  > 0 else "—"
+            o2_str   = f"{_rp['o2']:.0f}"   if _rp["o2"]   > 0 else "—"
+            infl_str = f"{_rp['infl']:.0f}" if _rp["infl"] > 0 else "—"
+            bcd_str  = f"{_rp['bcd']:.0f}"  if _rp["bcd"]  > 0 else "—"
             return [(sp_label, 60, "w"),
-                    (dil_p, 55, "e"), (dil_v, 45, "e"),
-                    (o2_p,  55, "e"), (o2_v,  45, "e"),
-                    (infl_p, 60, "e"), (infl_v, 45, "e"),
-                    (bcd_p, 60, "e"), (bcd_v, 45, "e"),
-                    (ccr_buoy_str, 95, "e"),
-                    (lo2_str, 60, "e"), (lhe_str, 55, "e")]
+                    (dil_str,  55, "e"),
+                    (o2_str,   55, "e"),
+                    (infl_str, 60, "e"),
+                    (bcd_str,  60, "e"),
+                    (_ccr_buoy_running(), 95, "e"),
+                    (loop_str, 80, "e")]
 
-        # Build CCR display rows (pre-deco + deco stops)
+        # Build CCR display rows in chronological order so running pressures
+        # are accurate: surface → descent → bottom → ascent → deco stops → surface
         ccr_display, ccr_extra = [], []
-        for s in self._saved_stops:
-            sp_lbl = s["gas"].split(" dil")[0] if " dil" in s["gas"] else s["gas"]
-            ccr_display.append({**s, "gas": dil_mix})
-            ccr_extra.append(_onboard_extra(sp_label=sp_lbl,
-                                            sp_value=ccr.sp_deco, depth=s["depth"]))
+        _rp_at_bailout: dict | None = None   # snapshot of _rp after bottom time
 
-        if ccr_display and segments:
-            # Use the simulation's actual first_stop depth (the rounded ceiling at
-            # GF_low) so the ascent transit time is correct even when early deco
-            # stops have 0-minute wait time and don't appear in the display list.
-            real_first_stop = self._ccr_first_stop_depth or ccr_display[0]["depth"]
-            pre_rows, pre_extra = [], []
+        if segments:
+            real_first_stop = (self._ccr_first_stop_depth
+                               or (self._saved_stops[0]["depth"] if self._saved_stops else 0.0))
             cur_d, cur_rt = 0.0, 0.0
 
-            pre_rows.append({"_label": "@ 0m", "depth": 0.0, "time": 0,
-                              "runtime": 0, "gas": dil_mix})
-            pre_extra.append(_onboard_extra(sp_label="", sp_value=None, depth=0.0))
+            # Surface row (initial pressures, no consumption yet)
+            ccr_display.append({"_label": "@ 0m", "depth": 0.0, "time": 0,
+                                 "runtime": 0, "gas": dil_mix})
+            ccr_extra.append(_onboard_extra(sp_label="", sp_value=None, depth=0.0))
 
             for seg_depth, total_seg_time in segments:
                 t_travel = 0.0
@@ -2760,48 +3044,69 @@ class DivePlannerTab(QWidget):
                     sp_val_tr  = None if going_down else ccr.setpoint
                     label_tr   = f"{'↓' if going_down else '↑'}{cur_d:.0f}→{seg_depth:.0f}m"
                     cur_rt    += t_travel
-                    pre_rows.append({"_label": label_tr, "depth": seg_depth,
-                                     "time": t_travel, "runtime": cur_rt, "gas": dil_mix})
-                    pre_extra.append(_onboard_extra(sp_label=sp_tr,
+                    _consume_ccr(t_travel, cur_d, seg_depth)
+                    if going_down and seg_depth >= _max_plan_depth:
+                        _apply_mask_clear()
+                    ccr_display.append({"_label": label_tr, "depth": seg_depth,
+                                        "time": t_travel, "runtime": cur_rt, "gas": dil_mix})
+                    ccr_extra.append(_onboard_extra(sp_label=sp_tr,
                                                     sp_value=sp_val_tr, depth=seg_depth))
                     cur_d = seg_depth
                 t_at = max(0.0, total_seg_time - t_travel)
                 if t_at > 0:
                     cur_rt += t_at
-                    pre_rows.append({"_label": f"{seg_depth:.0f}m", "depth": seg_depth,
-                                     "time": t_at, "runtime": cur_rt, "gas": dil_mix,
-                                     "_show_time": True})
-                    pre_extra.append(_onboard_extra(sp_label=sp_bottom_lbl,
+                    _consume_ccr(t_at, seg_depth, seg_depth)
+                    if seg_depth >= _max_plan_depth:
+                        _rp_at_bailout = dict(_rp)   # capture after bottom time at max depth
+                    ccr_display.append({"_label": f"{seg_depth:.0f}m", "depth": seg_depth,
+                                        "time": t_at, "runtime": cur_rt, "gas": dil_mix,
+                                        "_show_time": True})
+                    ccr_extra.append(_onboard_extra(sp_label=sp_bottom_lbl,
                                                     sp_value=ccr.setpoint, depth=seg_depth))
 
             if cur_d > real_first_stop:
-                # Ascent from bottom to simulation's first_stop at ascent rate
                 t_tr = (cur_d - real_first_stop) / asc_r
                 cur_rt += t_tr
-                pre_rows.append({"_label": f"↑{cur_d:.0f}→{real_first_stop:.0f}m",
-                                  "depth": real_first_stop, "time": t_tr, "runtime": cur_rt,
-                                  "gas": dil_mix})
-                pre_extra.append(_onboard_extra(sp_label=sp_bottom_lbl,
+                _consume_ccr(t_tr, cur_d, real_first_stop)
+                ccr_display.append({"_label": f"↑{cur_d:.0f}→{real_first_stop:.0f}m",
+                                     "depth": real_first_stop, "time": t_tr,
+                                     "runtime": cur_rt, "gas": dil_mix})
+                ccr_extra.append(_onboard_extra(sp_label=sp_bottom_lbl,
                                                 sp_value=ccr.setpoint, depth=real_first_stop))
+                cur_d = real_first_stop
 
-                # If 0-min stops exist between first_stop and first stop with
-                # actual wait time, show them as a deco-rate transit row so the
-                # diver can see that deco does NOT start at the displayed first stop.
-                first_wait_depth = ccr_display[0]["depth"] if ccr_display else real_first_stop
+                first_wait_depth = (self._saved_stops[0]["depth"]
+                                    if self._saved_stops else real_first_stop)
                 if real_first_stop > first_wait_depth:
                     t_deco_tr = (real_first_stop - first_wait_depth) / deco_r
-                    cur_rt += t_deco_tr
-                    pre_rows.append({"_label": f"↑{real_first_stop:.0f}→{first_wait_depth:.0f}m (deco rate)",
-                                      "depth": first_wait_depth, "time": t_deco_tr,
-                                      "runtime": cur_rt, "gas": dil_mix})
-                    pre_extra.append(_onboard_extra(sp_label=sp_deco_lbl,
+                    cur_rt   += t_deco_tr
+                    _consume_ccr(t_deco_tr, real_first_stop, first_wait_depth)
+                    ccr_display.append({"_label": f"↑{real_first_stop:.0f}→{first_wait_depth:.0f}m (deco rate)",
+                                         "depth": first_wait_depth, "time": t_deco_tr,
+                                         "runtime": cur_rt, "gas": dil_mix})
+                    ccr_extra.append(_onboard_extra(sp_label=sp_deco_lbl,
                                                     sp_value=ccr.sp_deco, depth=first_wait_depth))
+                    cur_d = first_wait_depth
 
-            ccr_display = pre_rows + ccr_display
-            ccr_extra   = pre_extra + ccr_extra
+            # Deco stops — built after pre-rows so running pressures are correct
+            for s in self._saved_stops:
+                # Inter-stop ascent transit
+                if s["depth"] < cur_d:
+                    t_asc = (cur_d - s["depth"]) / deco_r
+                    _consume_ccr(t_asc, cur_d, s["depth"])
+                    cur_d = s["depth"]
+                if s["depth"] <= 6.0:
+                    _apply_deco_refill()
+                _consume_ccr(s.get("time", 0), s["depth"], s["depth"])
+                sp_lbl = s["gas"].split(" dil")[0] if " dil" in s["gas"] else s["gas"]
+                ccr_display.append({**s, "gas": dil_mix})
+                ccr_extra.append(_onboard_extra(sp_label=sp_lbl,
+                                                sp_value=ccr.sp_deco, depth=s["depth"]))
+                cur_d = s["depth"]
 
         # Append surface row
         if ccr_display and result:
+            _consume_ccr(cur_d / deco_r if cur_d > 0 else 0.0, cur_d, 0.0)
             ccr_display.append({"_label": "↑ Surface", "depth": 0.0, "time": "",
                                 "runtime": result.runtime, "gas": dil_mix})
             ccr_extra.append(_onboard_extra(sp_label="", sp_value=None, depth=0.0))
@@ -2901,9 +3206,22 @@ class DivePlannerTab(QWidget):
                 slots[sidx]["pressure"] = f"{new_pres:.4f}"
                 return _rgl_from_slot(plan_copy, sidx, cyl, o2i, hei, is_j, T_c)
 
-            # bp_base = JJ+Diver+Stages from Buoyancy Planner (equipment/diver included)
+            # bp_base = buoyancy at the CCR bailout point (accounts for CCR gas already consumed)
+            _bail_snap = _rp_at_bailout or {}
+            _bail_delta = 0.0
+            for _rk, _vbot, _o2i, _hei, _tc, _p0 in _ccr_cyl_info:
+                if _vbot <= 0:
+                    continue
+                _p_snap = _bail_snap.get(_rk, _p0)
+                try:
+                    _gm0 = calc_gas_mass(_vbot, _p0,     _tc, _o2i, _hei) if _p0     > 0 else 0.0
+                    _gmn = calc_gas_mass(_vbot, _p_snap,  _tc, _o2i, _hei) if _p_snap > 0 else 0.0
+                    _bail_delta += _gm0 - _gmn
+                except Exception:
+                    pass
             try:
-                bp_base = float(self._bp_tab._sum_lbls["jj_diver_stages"].text())
+                bp_base = (ccr_buoy + _bail_delta) if ccr_buoy is not None else \
+                          float(self._bp_tab._sum_lbls["jj_diver_stages"].text())
             except (ValueError, AttributeError, KeyError):
                 bp_base = None
 
@@ -2936,7 +3254,7 @@ class DivePlannerTab(QWidget):
 
             # ── Prepend surface + descent rows to match CCR plan row count ───
             _empty_extra = [("—", 65, "e"), ("—", 75, "e"), ("—", 70, "e"),
-                            ("—", 80, "e"), ("—", 95, "e"), ("—", 85, "e")]
+                            ("—", 95, "e"), ("—", 85, "e")]
             bail_display.append({"_label": "@ 0m", "depth": 0.0,
                                   "time": 0, "runtime": 0, "gas": ""})
             bail_extra.append(_empty_extra)
@@ -2961,7 +3279,6 @@ class DivePlannerTab(QWidget):
             bail_extra.append([(f"{_snap_po2:.2f}", 65, "e"),
                                 (f"{snap_pres:.0f}" if snap_pres is not None else "—", 75, "e"),
                                 ("0", 70, "e"),
-                                (f"{snap_rgl:.0f}" if snap_rgl is not None else "—", 80, "e"),
                                 (f"{snap_buoy:+.2f}" if snap_buoy is not None else "—", 95, "e"),
                                 ("—", 85, "e")])
 
@@ -2989,12 +3306,15 @@ class DivePlannerTab(QWidget):
                     seg_gas_obj   = select_oc_gas(seg_top, oc_gases)
                     seg_gas_label = seg_gas_obj.label()
                     te = _trk(seg_gas_label)
+                    seg_pres_before = _get_pres(plan_base, te)
                     _consume(plan_drop, te, seg_L)
-                    seg_rest       = _consume(plan_base, te, seg_L)
+                    _consume(plan_base, te, seg_L)
                     seg_total_base = _total(plan_base)
                     seg_total_drop = _total(plan_drop)
                     seg_runtime_offset += seg_time
                     seg_pres = _get_pres(plan_base, te)
+                    seg_used_bar = (max(0.0, seg_pres_before - seg_pres)
+                                    if seg_pres_before is not None and seg_pres is not None else 0.0)
                     _seg_o2i = te.get("o2i", 0) if te else 0
                     _seg_po2 = (seg_top / 10.0 + 1.0) * (_seg_o2i / 100.0)
                     bail_display.append({"_label": f"↑{seg_top:.0f}→{seg_bot:.0f}m",
@@ -3006,8 +3326,7 @@ class DivePlannerTab(QWidget):
                     bail_extra.append([
                         (f"{_seg_po2:.2f}", 65, "e"),
                         (f"{seg_pres:.0f}" if seg_pres is not None else "—", 75, "e"),
-                        (f"{seg_L:.0f}", 70, "e"),
-                        (f"{seg_rest:.0f}" if seg_rest is not None else "—", 80, "e"),
+                        (f"{seg_used_bar:.0f}", 70, "e"),
                         (f"{seg_total_base:+.2f}" if seg_total_base is not None else "—", 95, "e"),
                         (drop_col, 85, "e"),
                     ])
@@ -3033,19 +3352,22 @@ class DivePlannerTab(QWidget):
                                           "runtime": seg_runtime_offset,
                                           "gas": delta_str_td})
                     bail_extra.append([
-                        ("", 65, "e"), ("", 75, "e"), ("", 70, "e"), ("", 80, "e"),
+                        ("", 65, "e"), ("", 75, "e"), ("", 70, "e"),
                         ("", 95, "e"),
                         (f"{buoy_after:+.2f}" if buoy_after is not None else "—", 85, "e"),
                     ])
 
             # Deco stops
             for i, stop in enumerate(bail_stops):
-                bar_abs = stop["depth"] / 10.0 + 1.0
-                used_L  = sac * stop["time"] * bar_abs
-                te      = _trk(stop["gas"])
+                bar_abs    = stop["depth"] / 10.0 + 1.0
+                used_L     = sac * stop["time"] * bar_abs
+                te         = _trk(stop["gas"])
+                pres_before = _get_pres(plan_base, te)
                 _consume(plan_drop, te, used_L)
-                rest_L     = _consume(plan_base, te, used_L)
+                _consume(plan_base, te, used_L)
                 pres_after = _get_pres(plan_base, te)
+                used_bar   = (max(0.0, pres_before - pres_after)
+                              if pres_before is not None and pres_after is not None else 0.0)
                 # Buoyancy after consuming this stop's gas AND transit to next stop/surface
                 import copy as _copy
                 _plan_tmp = _copy.deepcopy(plan_base)
@@ -3069,8 +3391,7 @@ class DivePlannerTab(QWidget):
                 bail_extra.append([
                     (f"{_stop_po2:.2f}", 65, "e"),
                     (f"{pres_after:.0f}" if pres_after is not None else "—", 75, "e"),
-                    (f"{used_L:.0f}", 70, "e"),
-                    (f"{rest_L:.0f}" if rest_L is not None else "—", 80, "e"),
+                    (f"{used_bar:.0f}", 70, "e"),
                     (f"{total_base:+.2f}" if total_base is not None else "—", 95, "e"),
                     (drop_col, 85, "e"),
                 ])
@@ -3094,7 +3415,7 @@ class DivePlannerTab(QWidget):
                                           "runtime": stop["runtime"],
                                           "gas": delta_str})
                     bail_extra.append([
-                        ("", 65, "e"), ("", 75, "e"), ("", 70, "e"), ("", 80, "e"),
+                        ("", 65, "e"), ("", 75, "e"), ("", 70, "e"),
                         ("", 95, "e"),
                         (f"{buoy_after:+.2f}" if buoy_after is not None else "—", 85, "e"),
                     ])
@@ -3117,7 +3438,7 @@ class DivePlannerTab(QWidget):
                 for _si, (_v, _w, _a) in enumerate(last_bail_extra):
                     if _si == 0 or _si == 2:
                         surface_extra.append(("—", _w, _a))
-                    elif _si == 4:
+                    elif _si == 3:
                         surface_extra.append((_final_buoy_str, _w, _a))
                     else:
                         surface_extra.append((_v, _w, _a))
@@ -3131,13 +3452,18 @@ class DivePlannerTab(QWidget):
             trk   = stage_tracking[slot_i] if (bail_stops and sac > 0 and stage_tracking
                                                 and slot_i < len(stage_tracking)) else None
             if trk is not None and plan_state_bp:
-                init_L = trk.get("real_gas_L", 0)
-                rem_L  = _rgl(plan_base, trk) if init_L > 0 else 0.0
-                used_L = max(0.0, init_L - (rem_L or 0.0))
-                gas_lbl = trk.get("label", "?")
+                init_L   = trk.get("real_gas_L", 0)
+                rem_L    = _rgl(plan_base, trk) if init_L > 0 else 0.0
+                cyl_t    = trk.get("cyl", {})
+                o2i_t    = trk.get("o2i", 0)
+                hei_t    = trk.get("hei", 0)
+                init_bar = _solve_pres(init_L, cyl_t, o2i_t, hei_t) if init_L > 0 else 0.0
+                rem_bar  = _get_pres(plan_base, trk) or 0.0
+                used_bar_c = max(0.0, init_bar - rem_bar)
+                gas_lbl  = trk.get("label", "?")
+                cyl_vol  = float(cyl_t.get("volume_bottle", 0)) if cyl_t else 0.0
             else:
-                init_L, used_L, rem_L = 0.0, 0.0, 0.0
-                # Try to get gas name from row even if no tracking
+                init_bar, used_bar_c, rem_bar, cyl_vol = 0.0, 0.0, 0.0, 0.0
                 gas_lbl = ""
                 if row_d:
                     o2 = row_d.get("o2", 0)
@@ -3145,39 +3471,107 @@ class DivePlannerTab(QWidget):
                     if o2 > 0:
                         gas_lbl = _gas_label(o2, he)
             self._bail_gas_chart_data.append({
-                "role":      _role_labels[slot_i],
-                "label":     gas_lbl,
-                "initial_L": init_L,
-                "used_L":    used_L,
-                "remain_L":  rem_L,
+                "role":        _role_labels[slot_i],
+                "label":       gas_lbl,
+                "initial_bar": init_bar,
+                "used_bar":    used_bar_c,
+                "remain_bar":  rem_bar,
+                "cyl_vol":     cyl_vol,
+                "max_bar":     init_bar,
             })
+
+        # ── Suppress interior Press/Used; show cumulative Used at segment end ─
+        # Extra-col layout: [0]=PO2, [1]=Press[bar], [2]=Used[bar], [3]=Buoy, [4]=m/drop
+        if bail_extra and display_list:
+            _dl = list(display_list)
+            _n  = len(_dl)
+
+            # Pass 1: cumulative used_bar per gas segment (reset on gas change)
+            _cum_used  = 0.0
+            _prev_seg  = None
+            _cum_at    = {}   # index -> cumulative used through this row
+            for _i in range(_n):
+                _row = _dl[_i]
+                if _row.get("_drop_marker") or not _row.get("gas"):
+                    continue
+                _g = _row["gas"]
+                if _g != _prev_seg:
+                    _cum_used = 0.0
+                    _prev_seg = _g
+                if _i < len(bail_extra):
+                    try:
+                        _cum_used += float(bail_extra[_i][2][0])
+                    except (ValueError, TypeError):
+                        pass
+                _cum_at[_i] = _cum_used
+
+            # Pass 2: assign display values
+            for _i in range(_n):
+                _row = _dl[_i]
+                if _row.get("_drop_marker") or not _row.get("gas") or _i >= len(bail_extra):
+                    continue
+                _g        = _row["gas"]
+                _prev_gas = _dl[_i - 1].get("gas", "") if _i > 0 else None
+                _next_gas = _dl[_i + 1].get("gas", "") if _i < _n - 1 else None
+                _is_first = _g != _prev_gas
+                _is_last  = _g != _next_gas
+                ex = list(bail_extra[_i])
+                if _is_first or _is_last:
+                    if _is_last:
+                        ex[2] = (f"{_cum_at.get(_i, 0.0):.0f}", ex[2][1], ex[2][2])
+                    # first row: keep original per-row used value unchanged
+                else:
+                    ex[1] = ("—", ex[1][1], ex[1][2])   # Press[bar]
+                    ex[2] = ("—", ex[2][1], ex[2][2])   # Used[bar]
+                bail_extra[_i] = ex
 
         self._render_stops(display_list, self._bail_table_area,
                            extra_data=bail_extra, has_pre_gas=False)
 
         # ── CCR gas consumption chart data ───────────────────────────────────
         if result and segments:
-            V_loop   = self._get_setting("_ccr_loop_vol",  7.0)
-            o2_rate  = self._get_setting("_ccr_o2_rate",   0.3)
-            V_suit   = self._get_setting("_ccr_suit_vol",  4.0)
             max_d    = max(d for d, _ in segments)
             p_bottom = P_SURF + max_d * WATER_DENSITY / 10.0
             delta_p  = max(0.0, p_bottom - P_SURF)
 
-            dil_used  = V_loop * delta_p
-            o2_used   = o2_rate * result.runtime
-            infl_used = V_suit  * delta_p
+            dil_used  = V_loop * delta_p * _dil_factor
+            o2_used   = o2_rate * result.runtime * _o2_factor
 
-            # Initial volumes from onboard slots (already computed as strings)
+            _req_extra    = max(0.0, -(ccr_buoy or 0.0))
+            _dry_extra_kg = min(_req_extra, _extra_cap_kg)
+            _bcd_extra_kg = _req_extra - _dry_extra_kg
+            _dry_total_kg = _baseline_lift_kg + _dry_extra_kg
+            infl_used = (_dry_total_kg / WATER_DENSITY) * delta_p * _infl_factor
+            bcd_used  = (_bcd_extra_kg / WATER_DENSITY) * delta_p * _infl_factor
+            if _bcd_is_shared:
+                infl_used += bcd_used
+                bcd_used   = 0.0
+
+            # One-time events: mask clear (diluent at depth) and deco refill (O2 at surface)
+            dil_used += _mask_clear_vol * p_bottom
+            o2_used  += _deco_refill_vol
+
             def _parse_vol(s):
                 try:    return float(str(s).strip())
                 except: return 0.0
+            def _parse_pres(s):
+                try:    return float(str(s).strip())
+                except: return 0.0
+
+            def _used_bar(used_l, init_l, init_bar):
+                return (used_l / init_l * init_bar) if init_l > 0 else 0.0
+
+            _dil_ib  = _parse_pres(dil_p);  _dil_il  = _parse_vol(dil_v)
+            _o2_ib   = _parse_pres(o2_p);   _o2_il   = _parse_vol(o2_v)
+            _infl_ib = _parse_pres(infl_p); _infl_il = _parse_vol(infl_v)
+            _bcd_ib  = _parse_pres(bcd_p);  _bcd_il  = _parse_vol(bcd_v)
 
             self._ccr_gas_chart_data = [
-                {"label": dil_mix,    "initial_L": _parse_vol(dil_v),  "used_L": dil_used},
-                {"label": "O2 100%",  "initial_L": _parse_vol(o2_v),   "used_L": o2_used},
-                {"label": "Inflation","initial_L": _parse_vol(infl_v),  "used_L": infl_used},
-                {"label": "BCD",      "initial_L": _parse_vol(bcd_v),   "used_L": 0.0},
+                {"label": dil_mix,    "initial_bar": _dil_ib,  "used_bar": _used_bar(dil_used,  _dil_il,  _dil_ib),  "cyl_vol": dil_cv,  "max_bar": _dil_ib},
+                {"label": "O2 100%",  "initial_bar": _o2_ib,   "used_bar": _used_bar(o2_used,   _o2_il,   _o2_ib),   "cyl_vol": o2_cv,   "max_bar": _o2_ib},
+                {"label": "Inflation","initial_bar": _infl_ib, "used_bar": _used_bar(infl_used, _infl_il, _infl_ib), "cyl_vol": infl_cv, "max_bar": _infl_ib},
+                {"label": "BCD",      "initial_bar": _bcd_ib,  "used_bar": _used_bar(bcd_used,  _bcd_il,  _bcd_ib),  "cyl_vol": bcd_cv,  "max_bar": _bcd_ib,
+                 "is_shared": _bcd_is_shared},
             ]
         else:
             self._ccr_gas_chart_data = []

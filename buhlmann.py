@@ -40,7 +40,9 @@ TISSUES: List[Tuple] = [
     (635.0, 0.2327, 0.9653, 240.03, 0.5119, 0.9267),
 ]
 
-PH2O          = 0.0627   # alveolar water vapour [bar] at 37 °C
+# Alveolært vanndamptrykk ved 37 °C (kroppstemperatur).
+# 47 mmHg = 0.0627 bar. Konvensjonell verdi i Schreiner/Workman/Bühlmann.
+PH2O          = 0.0627
 P_SURF        = 1.0      # surface pressure [bar]
 WATER_DENSITY = 1.025    # seawater [kg/L] — use 1.000 for fresh water
 STOP_INT = 3.0      # deco stop interval [m]
@@ -339,7 +341,9 @@ def simulate_dive(
             pn2_e, phe_e, _ = _inspired(d_e, mode, ccr, oc_gases, sp=sp)
             state.load(d_s, d_e, chunk, pn2_s, pn2_e, phe_s, phe_e)
             if mode == "ccr" and ccr:
-                po2 = sp if sp > 0 else ccr.setpoint
+                sp_eff = sp if sp > 0 else ccr.setpoint
+                p_mid  = _p_amb((d_s + d_e) / 2)
+                po2    = max(0.0, min(sp_eff, p_mid - PH2O))
             else:
                 gas = select_oc_gas((d_s + d_e) / 2, oc_gases)
                 po2 = _p_amb((d_s + d_e) / 2) * gas.o2
