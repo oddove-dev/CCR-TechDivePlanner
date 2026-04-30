@@ -150,6 +150,18 @@ def _compute_buoyancy_from_plan(db: dict, plan_state: dict,
             v_lead = lead / RHO_PB if RHO_PB else 0.0
             lb_sw = v_lead * RHO_SW - lead
             total += -lb_sw   # diver_buoyancy_sw = -lead_buoyancy_sw
+            for slot in ("clothing_slot_1", "clothing_slot_2"):
+                cname = d.get(slot, "")
+                if cname:
+                    ce = _find_equip(db, cname)
+                    if ce:
+                        try:
+                            cdry = float(ce.get("dry_mass") or 0)
+                            cwet = float(ce.get("wet_mass") or 0)
+                            cvol = (cdry - cwet) / RHO_FW if RHO_FW else 0.0
+                            total += cvol * RHO_SW - cdry
+                        except (ValueError, TypeError):
+                            pass
             has_any = True
         else:
             eq = _find_equip(db, name)
@@ -508,9 +520,9 @@ class DivePlannerTab(QWidget):
         ("BO deco sw SP [bar]","_deko_sw",     "1.6"),
         ("Stop interval [m]",  "_stop_int",    "3"),
         ("Display int [m]",    "_display_int", "3"),
-        ("Heatmap int [min]",  "_heatmap_int", "0.1"),
         ("Loop vol [L]",       "_ccr_loop_vol","7"),
         ("Metab O2 [L/min]",   "_ccr_o2_rate", "0.3"),
+        ("Bailout time before ascent", "_bail_deco_time", "0"),
     ]
     # Gas Correction tab — correction factors and one-time events
     _GAS_CORR_FIELDS = [
@@ -523,11 +535,11 @@ class DivePlannerTab(QWidget):
     # Gas Correction tab — drysuit/BCD sizing
     _BUOYANCY_FIELDS = [
         ("Drysuit extra capacity [kg]", "_drysuit_extra_cap", "3.0"),
-        ("BCD max capacity [kg]",       "_bcd_max_cap",       "15.0"),
     ]
     # Combined list used by save/load (includes deprecated Gas Correction tab fields)
     _SETTINGS_FIELDS = _GENERAL_FIELDS + _GAS_CORR_FIELDS + _BUOYANCY_FIELDS + [
         ("Drysuit vol [L]",    "_ccr_suit_vol","4"),
+        ("Heatmap int [min]",  "_heatmap_int", "0.1"),
     ]
 
     def _build_settings(self):
@@ -659,6 +671,20 @@ class DivePlannerTab(QWidget):
             gc_grid.addWidget(lbl, row, col_lbl, Qt.AlignmentFlag.AlignLeft)
             gc_grid.addWidget(le,  row, col_ent, Qt.AlignmentFlag.AlignRight)
 
+            if attr == "_drysuit_extra_cap":
+                help_lbl = QLabel("?")
+                help_lbl.setStyleSheet(
+                    "color:#2277cc; font-weight:bold; font-size:11px; "
+                    "border:1px solid #2277cc; border-radius:7px; padding:0px 4px;")
+                help_lbl.setToolTip(
+                    "Drysuit extra capacity [kg]:\n\n"
+                    "Maximum additional lift the drysuit can provide above baseline.\n"
+                    "If more lift is needed, the BCD handles the remainder.\n\n"
+                    "Example: 3 kg means the drysuit provides up to 3 kg of extra lift.\n"
+                    "If 5 kg extra is needed → drysuit takes 3 kg, BCD takes 2 kg."
+                )
+                gc_grid.addWidget(help_lbl, row, 5, Qt.AlignmentFlag.AlignLeft)
+
         # Info row spanning full width below both columns
         self._drysuit_baseline_lbl = QLabel("Drysuit baseline lift: —")
         self._drysuit_baseline_lbl.setStyleSheet("color:#888888;")
@@ -772,10 +798,20 @@ class DivePlannerTab(QWidget):
         rep_box.setStyleSheet("QGroupBox { color: #aa8844; }")
         rep_l = QHBoxLayout(rep_box)
         rep_l.setContentsMargins(4, 8, 4, 4)
+        rep_l.setSpacing(12)
         b_rep = QPushButton("Generate Report")
         b_rep.setStyleSheet("background:#7a5c00; color:white; font-weight:bold; padding:3px 8px;")
         b_rep.clicked.connect(self._open_report)
-        rep_l.addWidget(b_rep); rep_l.addStretch()
+        rep_l.addWidget(b_rep)
+        rep_l.addStretch()
+        hm_lbl = QLabel("Heatmap int [min]:")
+        self._heatmap_int_le = QLineEdit("0.1")
+        self._heatmap_int_le.setFixedWidth(50)
+        self._heatmap_int_le.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._heatmap_int_le.setStyleSheet(f"background:{CLR_INPUT};")
+        self._heatmap_int_le.textChanged.connect(self._on_input_change)
+        rep_l.addWidget(hm_lbl)
+        rep_l.addWidget(self._heatmap_int_le)
         bail_ts_l.addWidget(rep_box)
         return bail_ts
 
@@ -1677,11 +1713,11 @@ class DivePlannerTab(QWidget):
 
         self._bail_table_area = self._build_result_table(
             vl,
-            base_cols=[("Depth / Label", 130, "w"), ("Stop", 50, "e"),
-                       ("Runtime", 62, "e"), ("Gas", 95, "w")],
-            extra_cols=[("PO2[bar]", 65, "e"), ("Press[bar]", 75, "e"),
-                        ("Used[bar]", 70, "e"),
-                        ("Buoyancy[kg]", 95, "e"), ("m/drop[kg]", 85, "e")],
+            base_cols=[("Depth / Label", 115, "w"), ("Stop", 46, "e"),
+                       ("Runtime", 58, "e"), ("Gas", 88, "w")],
+            extra_cols=[("PO2[bar]", 62, "e"), ("Press[bar]", 72, "e"),
+                        ("Used[bar]", 66, "e"),
+                        ("Buoyancy[kg]", 82, "e"), ("m/drop[kg]", 80, "e")],
         )
 
         hbox_layout.addWidget(box, 1)
@@ -2257,6 +2293,27 @@ class DivePlannerTab(QWidget):
         t_ccr, d_ccr = _profile_from_tl(ccr_tl)
         t_bail, d_bail = _profile_from_tl(bail_tl)
 
+        # Shift bailout profile: remove bail_extra phase, OC ascent starts at CCR ascent time
+        _bail_extra_chart = getattr(self, '_bail_extra_chart', 0.0)
+        _bail_mark_t0 = _bail_mark_t1 = _bail_mark_d = None
+        if t_bail and _bail_extra_chart > 0:
+            _ccr_end = sum(t for _, t in (segments or []))
+            _bail_end = _ccr_end + _bail_extra_chart
+            t_bail_new, d_bail_new, _anchor_added = [], [], False
+            for t, d in zip(t_bail, d_bail):
+                if t <= _ccr_end:
+                    t_bail_new.append(t); d_bail_new.append(d)
+                elif t > _bail_end:
+                    if not _anchor_added:
+                        t_bail_new.append(_ccr_end); d_bail_new.append(d)
+                        _anchor_added = True
+                    t_bail_new.append(t - _bail_extra_chart); d_bail_new.append(d)
+            t_bail, d_bail = t_bail_new, d_bail_new
+            # Mark the OC bail period at the bottom
+            _bail_mark_d  = max(d_ccr) if d_ccr else 0.0
+            _bail_mark_t0 = _ccr_end - _bail_extra_chart
+            _bail_mark_t1 = _ccr_end
+
         if not t_ccr and not segments:
             ax.text(0.5, 0.5, "No dive data", ha="center", va="center",
                     transform=ax.transAxes, color="#888888", fontsize=9)
@@ -2292,6 +2349,15 @@ class DivePlannerTab(QWidget):
             ax.plot(t_bail, d_bail, color="#e07a20", linewidth=1.4,
                     linestyle="--", alpha=0.85, label="Bailout OC")
 
+        # OC bail period marker at bottom depth
+        if _bail_mark_t0 is not None and _bail_mark_d:
+            ax.hlines(_bail_mark_d, _bail_mark_t0, _bail_mark_t1,
+                      colors="#e07a20", linewidth=6, alpha=0.55, zorder=4)
+            ax.text(_bail_mark_t1, _bail_mark_d,
+                    f"  +{_bail_extra_chart:.0f} min OC",
+                    ha="left", va="center", fontsize=6.5, color="#b05010",
+                    fontweight="bold")
+
         # Deco stop markers from saved stops
         for s in self._saved_stops:
             dep = s.get("depth", 0)
@@ -2313,6 +2379,17 @@ class DivePlannerTab(QWidget):
         if t_bail:
             ax.legend(fontsize=6.5, loc="lower right",
                       facecolor="#e8f0f8", edgecolor="#aabbcc")
+
+        if t_ccr and len(t_ccr) > 1 and t_ccr[-1] > 0:
+            trapz_fn = getattr(_np, "trapezoid", None) or getattr(_np, "trapz", None)
+            avg_d = trapz_fn(d_ccr, t_ccr) / t_ccr[-1]
+            ax.text(0.98, 0.50, f"Avg depth: {avg_d:.1f} m",
+                    transform=ax.transAxes,
+                    ha="right", va="center", fontsize=7,
+                    color="#223344",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="#e8f0f8",
+                              edgecolor="#aabbcc", alpha=0.85))
+
         self._profile_canvas.draw()
 
     def _draw_tissue_chart(self):
@@ -2859,10 +2936,10 @@ class DivePlannerTab(QWidget):
             onboard_vols.append(vol_v)
             onboard_cylvols.append(cylvol_v)
 
-        try:
-            ccr_buoy = float(self._bp_tab._sum_lbls["jj_diver_stages"].text())
-            ccr_buoy_str = f"{ccr_buoy:+.2f}"
-        except (ValueError, AttributeError, KeyError):
+        if plan_state_bp:
+            ccr_buoy = _compute_buoyancy_from_plan(self._db, plan_state_bp, T_c)
+            ccr_buoy_str = f"{ccr_buoy:+.2f}" if ccr_buoy is not None else "—"
+        else:
             ccr_buoy = None
             ccr_buoy_str = "—"
 
@@ -3028,6 +3105,7 @@ class DivePlannerTab(QWidget):
             real_first_stop = (self._ccr_first_stop_depth
                                or (self._saved_stops[0]["depth"] if self._saved_stops else 0.0))
             cur_d, cur_rt = 0.0, 0.0
+            ccr_bottom_rt = 0.0  # runtime at end of CCR bottom stop (used for bailout @ row)
 
             # Surface row (initial pressures, no consumption yet)
             ccr_display.append({"_label": "@ 0m", "depth": 0.0, "time": 0,
@@ -3058,6 +3136,7 @@ class DivePlannerTab(QWidget):
                     _consume_ccr(t_at, seg_depth, seg_depth)
                     if seg_depth >= _max_plan_depth:
                         _rp_at_bailout = dict(_rp)   # capture after bottom time at max depth
+                        ccr_bottom_rt = cur_rt       # CCR runtime at end of bottom stop
                     ccr_display.append({"_label": f"{seg_depth:.0f}m", "depth": seg_depth,
                                         "time": t_at, "runtime": cur_rt, "gas": dil_mix,
                                         "_show_time": True})
@@ -3120,28 +3199,37 @@ class DivePlannerTab(QWidget):
         bail_total_runtime = None
         if oc_gases:
             try:
+                _bail_extra = max(0.0, self._get_setting("_bail_deco_time", 0.0))
+                self._bail_extra_chart = _bail_extra  # for profile chart time correction
+                bail_segments = segments  # full CCR bottom time for deco loading
                 bail = simulate_bailout_from_bottom(
-                    segments=segments, ccr=ccr, oc_gases=oc_gases,
+                    segments=bail_segments, ccr=ccr, oc_gases=oc_gases,
                     gf_low=gf_lo, gf_high=gf_hi,
                     desc_rate=desc_r, asc_rate=asc_r, deco_rate=deco_r,
                     snap_interval=max(0.1, self._get_setting("_heatmap_int", 1.0)),
                     stop_interval=max(1.0, self._get_setting("_stop_int", 3.0)),
+                    bail_extra=_bail_extra,
                 )
+                # Offset: align simulation runtimes to CCR display runtime.
+                # bail_extra OC time at depth is now IN the simulation, so add it to _sim_bottom_exit.
+                _sim_bottom_exit = sum(t for _, t in bail_segments) + _bail_extra
+                _bail_rt_offset  = ccr_bottom_rt - _sim_bottom_exit
                 self._bail_summary_lbl.setText(
-                    f"Bailout at: {bail.bottom_time:.0f} min  |  "
+                    f"Bailout at: {ccr_bottom_rt:.0f} min  |  "
                     f"TTS: {bail.tts:.0f} min  |  "
-                    f"Runtime: {bail.runtime:.0f} min  |  "
+                    f"Runtime: {bail.runtime + _bail_rt_offset:.0f} min  |  "
                     f"OTU: {bail.otu:.0f}  |  CNS: {bail.cns:.1f} %"
                 )
                 bail_stops = [
-                    {"depth": s.depth, "time": s.time, "runtime": s.runtime, "gas": s.gas}
+                    {"depth": s.depth, "time": s.time,
+                     "runtime": s.runtime + _bail_rt_offset, "gas": s.gas}
                     for s in bail.stops
                 ]
                 self._bail_tissue_timeline  = bail.tissue_timeline
                 self._bail_phase_list       = bail.tissue_phase_list
                 self._bail_first_stop_depth = bail.first_stop_depth
                 self._bail_saved_stops      = bail_stops
-                bail_total_runtime          = bail.runtime
+                bail_total_runtime          = bail.runtime + _bail_rt_offset
             except Exception as e:
                 self._bail_summary_lbl.setText(f"Error: {e}")
                 bail_stops                  = []
@@ -3267,18 +3355,32 @@ class DivePlannerTab(QWidget):
             # Snapshot row at bailout depth
             _bailout_gas = select_oc_gas(max_depth_seg, oc_gases) if oc_gases else None
             snap_gas_lbl = _bailout_gas.label() if _bailout_gas else (bail_stops[0]["gas"] if bail_stops else "")
-            snap_buoy    = _total(plan_base)
             snap_te      = _trk(snap_gas_lbl)
             snap_pres    = _get_pres(plan_base, snap_te)
-            snap_rgl     = _rgl(plan_base, snap_te) if snap_te else None
             _snap_o2i    = snap_te.get("o2i", 0) if snap_te else 0
             _snap_po2    = (max_depth_seg / 10.0 + 1.0) * (_snap_o2i / 100.0)
-            bail_display.append({"_label": f"@ {max_depth_seg:.0f}m",
-                                  "depth": max_depth_seg, "time": 0,
-                                  "runtime": 0, "gas": snap_gas_lbl})
+
+            # Consume extra OC gas for _bail_extra minutes at depth
+            _snap_used_bar = 0
+            if _bail_extra > 0 and snap_te:
+                _extra_L = sac * _bail_extra * (max_depth_seg / 10.0 + 1.0)
+                _consume(plan_drop, snap_te, _extra_L)
+                _consume(plan_base, snap_te, _extra_L)
+                _snap_pres_after = _get_pres(plan_base, snap_te)
+                _snap_used_bar = max(0, round((snap_pres or 0) - (_snap_pres_after or 0)))
+
+            snap_buoy = _total(plan_base)
+
+            _bail_extra_lbl = (f"@ {max_depth_seg:.0f}m  +{_bail_extra:.0f} min"
+                               if _bail_extra > 0 else f"@ {max_depth_seg:.0f}m")
+            bail_display.append({"_label": _bail_extra_lbl,
+                                  "depth": max_depth_seg,
+                                  "time": _bail_extra if _bail_extra > 0 else 0,
+                                  "runtime": ccr_bottom_rt,
+                                  "gas": snap_gas_lbl})
             bail_extra.append([(f"{_snap_po2:.2f}", 65, "e"),
                                 (f"{snap_pres:.0f}" if snap_pres is not None else "—", 75, "e"),
-                                ("0", 70, "e"),
+                                (f"{_snap_used_bar}" if _snap_used_bar else "0", 70, "e"),
                                 (f"{snap_buoy:+.2f}" if snap_buoy is not None else "—", 95, "e"),
                                 ("—", 85, "e")])
 
@@ -3291,8 +3393,7 @@ class DivePlannerTab(QWidget):
                 first_stop_d = bail_real_first
                 waypoints = _oc_ascent_waypoints(max_depth_seg, first_stop_d, oc_gases)
                 total_transit_time = (max_depth_seg - first_stop_d) / asc_r
-                seg_runtime_offset = (bail_stops[0]["runtime"]
-                                      - bail_stops[0]["time"] - total_transit_time)
+                seg_runtime_offset = ccr_bottom_rt
                 seg_top = max_depth_seg
                 transit_gas_label = (select_oc_gas(max_depth_seg, oc_gases).label()
                                      if oc_gases else None)

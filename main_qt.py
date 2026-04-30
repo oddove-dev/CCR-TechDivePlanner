@@ -423,12 +423,7 @@ class EquipmentDialog(QDialog):
         ("JJ Modular Buoyancy", "jj_modular"),
         ("Diver Buoyancy",      "diver_buoyancy"),
         ("Stage Buoyancy",      "stage"),
-        ("Baseline Buoyancy",   "baseline_buoyancy"),
     ]
-    _BASELINE_TOOLTIP = (
-        "Marks this element as the source of drysuit baseline lift in the inflation "
-        "gas calculation. Only one element per Buoyancy Plan should have this flag."
-    )
 
     def __init__(self, parent, data: dict | None = None, db: dict | None = None):
         super().__init__(parent)
@@ -463,8 +458,6 @@ class EquipmentDialog(QDialog):
             cb = QCheckBox(label)
             cb.setChecked(bool(self._data.get(key, False)))
             cb.stateChanged.connect(self._recalc)
-            if key == "baseline_buoyancy":
-                cb.setToolTip(self._BASELINE_TOOLTIP)
             self._checks[key] = cb
             left_lay.addWidget(cb, r, 0, 1, 2)
             r += 1
@@ -562,27 +555,6 @@ class EquipmentDialog(QDialog):
         for label, key in self.CHECKS:
             self._data[key] = self._checks[key].isChecked()
         self._data["category"] = self._category()
-        if self._data.get("baseline_buoyancy") and self._db is not None:
-            current_name = self._data.get("name", "")
-            conflict = next(
-                (e["name"] for e in self._db.get("equipment", [])
-                 if e.get("baseline_buoyancy") and e.get("name") != current_name),
-                None,
-            ) or next(
-                (d["name"] for d in self._db.get("divers", [])
-                 if d.get("baseline_buoyancy") and d.get("name") != current_name),
-                None,
-            )
-            if conflict:
-                reply = QMessageBox.question(
-                    self, "Duplicate Baseline Buoyancy",
-                    f"'{conflict}' already has Baseline Buoyancy flagged.\n"
-                    "Continue and have two? (Multiple flags will cause a warning "
-                    "in the inflation model.)",
-                    QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
-                )
-                if reply != QMessageBox.StandardButton.Ok:
-                    return
         self.accept()
 
     def result_data(self) -> dict:
@@ -610,15 +582,17 @@ def _compute_diver(lead_dry, diver_dry=None):
 
 
 _DIVER_PREVIEW_ROWS = [
-    ("Lead dry weight [kg]",       "lead_dry_mass",     False),
-    ("Diver dry mass [kg]",        "diver_dry_mass",    False),
-    ("Lead density [kg/L]",        "rho_pb",            False),
-    ("Lead volume [L]",            "lead_volume",       False),
-    ("Diver volume [L]",           "diver_volume",      False),
-    ("Lead buoyancy SW [kg]",      "lead_buoyancy_sw",  False),
-    ("Diver buoyancy FW ref [kg]", "diver_buoyancy_fw", True),
-    ("Diver buoyancy SW ref [kg]", "diver_buoyancy_sw", True),
-    ("Category",                   "category",          False),
+    ("Lead dry weight [kg]",       "lead_dry_mass",      False),
+    ("Diver dry mass [kg]",        "diver_dry_mass",     False),
+    ("Lead density [kg/L]",        "rho_pb",             False),
+    ("Lead volume [L]",            "lead_volume",        False),
+    ("Diver volume [L]",           "diver_volume",       False),
+    ("Lead buoyancy SW [kg]",      "lead_buoyancy_sw",   False),
+    ("Diver buoyancy FW ref [kg]", "diver_buoyancy_fw",  True),
+    ("Diver buoyancy SW ref [kg]", "diver_buoyancy_sw",  True),
+    ("Clothing buoyancy SW [kg]",  "clothing_buoyancy",  True),
+    ("Buoyancy SW summary [kg]",   "buoyancy_summary",   True),
+    ("Category",                   "category",           False),
 ]
 
 
@@ -675,6 +649,20 @@ class DiverDialog(QDialog):
         self._cb_baseline.setToolTip(self._BASELINE_TOOLTIP)
         left_lay.addWidget(self._cb_baseline, r_cb + 1, 0, 1, 2)
 
+        # Clothing dropdowns
+        equip_names = ["(none)"] + [e["name"] for e in (self._db or {}).get("equipment", [])]
+        self._clothing_cbs: list[QComboBox] = []
+        for i, slot_key in enumerate(("clothing_slot_1", "clothing_slot_2")):
+            left_lay.addWidget(QLabel(f"Clothing {i + 1}:"), r_cb + 2 + i, 0)
+            cb = QComboBox()
+            cb.addItems(equip_names)
+            saved = self._data.get(slot_key, "")
+            if saved and saved in equip_names:
+                cb.setCurrentText(saved)
+            cb.currentIndexChanged.connect(self._recalc)
+            left_lay.addWidget(cb, r_cb + 2 + i, 1)
+            self._clothing_cbs.append(cb)
+
         # Buttons
         btn_lay = QHBoxLayout()
         label_txt = "Save" if self._is_edit else "Add to database"
@@ -685,7 +673,7 @@ class DiverDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         btn_lay.addWidget(ok_btn)
         btn_lay.addWidget(cancel_btn)
-        left_lay.addLayout(btn_lay, r_cb + 2, 0, 1, 2)
+        left_lay.addLayout(btn_lay, r_cb + 4, 0, 1, 2)
 
         # ── Right: calculated preview ─────────────────────────────────────────
         right_box = QGroupBox("Calculated preview")
@@ -708,21 +696,46 @@ class DiverDialog(QDialog):
 
         self._recalc()
 
+    def _clothing_buoyancy_sw(self) -> float | None:
+        equip_map = {e["name"]: e for e in (self._db or {}).get("equipment", [])}
+        total = 0.0
+        any_selected = False
+        for cb in self._clothing_cbs:
+            name = cb.currentText()
+            if name == "(none)":
+                continue
+            e = equip_map.get(name)
+            if e:
+                try:
+                    r = _compute_equip(float(e["dry_mass"]), float(e["wet_mass"]))
+                    total += r["buoyancy_sw"]
+                    any_selected = True
+                except (ValueError, TypeError, KeyError):
+                    pass
+        return total if any_selected else None
+
     def _recalc(self):
         try:
             lead = float(self._entries["lead_dry_mass"].text().replace(",","."))
             diver_str = self._entries["diver_dry_mass"].text().strip().replace(",",".")
             diver = float(diver_str) if diver_str else None
             r = _compute_diver(lead, diver)
+            clothing_sw = self._clothing_buoyancy_sw()
             for key, lbl in self._preview_labels.items():
                 if key == "category":
                     lbl.setText("Diver Buoyancy" if self._cb_diver.isChecked() else "")
+                elif key == "clothing_buoyancy":
+                    lbl.setText(f"{clothing_sw:.3f}" if clothing_sw is not None else "---")
+                elif key == "buoyancy_summary":
+                    diver_sw = r.get("diver_buoyancy_sw")
+                    if diver_sw is not None:
+                        lbl.setText(f"{diver_sw + (clothing_sw or 0.0):.3f}")
+                    else:
+                        lbl.setText("---")
                 else:
                     val = r.get(key)
                     if val is None:
                         lbl.setText("---")
-                    elif key == "rho_pb":
-                        lbl.setText(f"{val:.3f}")
                     else:
                         lbl.setText(f"{val:.3f}")
         except (ValueError, ZeroDivisionError):
@@ -745,27 +758,10 @@ class DiverDialog(QDialog):
                     return
         self._data["category"]          = "Diver Buoyancy" if self._cb_diver.isChecked() else ""
         self._data["baseline_buoyancy"] = self._cb_baseline.isChecked()
-        if self._data["baseline_buoyancy"] and self._db is not None:
-            current_name = self._data.get("name", "")
-            conflict = next(
-                (d["name"] for d in self._db.get("divers", [])
-                 if d.get("baseline_buoyancy") and d.get("name") != current_name),
-                None,
-            ) or next(
-                (e["name"] for e in self._db.get("equipment", [])
-                 if e.get("baseline_buoyancy") and e.get("name") != current_name),
-                None,
-            )
-            if conflict:
-                reply = QMessageBox.question(
-                    self, "Duplicate Baseline Buoyancy",
-                    f"'{conflict}' already has Baseline Buoyancy flagged.\n"
-                    "Continue and have two? (Multiple flags will cause a warning "
-                    "in the inflation model.)",
-                    QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Ok,
-                )
-                if reply != QMessageBox.StandardButton.Ok:
-                    return
+        slot_keys = ("clothing_slot_1", "clothing_slot_2")
+        for cb, slot_key in zip(self._clothing_cbs, slot_keys):
+            name = cb.currentText()
+            self._data[slot_key] = "" if name == "(none)" else name
         self.accept()
 
     def result_data(self) -> dict:
@@ -1318,7 +1314,18 @@ class _EquipRow(QWidget):
                 self._dry_lbl.setText(f"{diver_dry:.2f}")
             else:
                 self._dry_lbl.setText("---")
-            self._buoy_lbl.setText(f"{r['diver_buoyancy_sw']:.2f}")
+            clothing_buoy = 0.0
+            for slot in ("clothing_slot_1", "clothing_slot_2"):
+                cname = diver.get(slot, "")
+                if cname:
+                    ce = next((e for e in self._db.get("equipment", []) if e["name"] == cname), None)
+                    if ce:
+                        try:
+                            cr = _compute_equip(float(ce.get("dry_mass", 0)), float(ce.get("wet_mass", 0)))
+                            clothing_buoy += cr["buoyancy_sw"]
+                        except (ValueError, TypeError):
+                            pass
+            self._buoy_lbl.setText(f"{r['diver_buoyancy_sw'] + clothing_buoy:.2f}")
         elif equip:
             dry = equip.get("dry_mass") or 0
             wet = equip.get("wet_mass") or 0

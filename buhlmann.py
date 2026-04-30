@@ -471,9 +471,11 @@ def simulate_bailout_from_bottom(
     deco_rate:     float = 3.0,
     snap_interval: float = 1.0,
     stop_interval: float = 3.0,
+    bail_extra:    float = 0.0,
 ) -> DiveResult:
     """
     Worst-case bailout: simulate CCR bottom phase (descent + segments),
+    optionally followed by bail_extra minutes on OC at depth,
     then ascend OC from that tissue state using oc_gases.
     """
     if not oc_gases:
@@ -556,6 +558,11 @@ def simulate_bailout_from_bottom(
 
     # ── Bailout switch point ───────────────────────────────────────────────────
     phase_list.append((runtime, current_depth, "bailout", state.snapshot()))
+
+    # ── Extra OC time at depth (bail_extra min on OC gas before ascending) ─────
+    if bail_extra > 0.0 and current_depth > 0.0:
+        _load_oc(current_depth, current_depth, bail_extra)
+        phase_list.append((runtime, current_depth, "oc_bottom", state.snapshot()))
 
     # ── OC ascent from bottom tissue state ─────────────────────────────────────
     snap_bottom = state.snapshot()
