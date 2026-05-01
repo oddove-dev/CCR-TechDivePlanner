@@ -1035,6 +1035,7 @@ class _CylCard(QGroupBox):
         self._db = db
         self._on_change = on_change
         self._res: dict[str, QLabel] = {}
+        self._buoy_exact: float | None = None
 
         lay = QGridLayout(self)
         lay.setSpacing(2)
@@ -1154,6 +1155,7 @@ class _CylCard(QGroupBox):
         name = self._cyl_cb.currentText()
         cyl = next((c for c in self._db.get("cylinders", []) if c["name"] == name), None)
         if cyl is None or name == "—":
+            self._buoy_exact = None
             for v in self._res.values():
                 v.setText("---")
             if self._on_change:
@@ -1182,6 +1184,7 @@ class _CylCard(QGroupBox):
                 "real_gas":    vbot * p_abs / Z if Z else 0,
                 "ideal_gas":   vbot * pres,
             }
+            self._buoy_exact = vals["buoyancy_sw"]
             for key, lbl in self._res.items():
                 v = vals[key]
                 if key in ("o2", "he"):
@@ -1197,16 +1200,14 @@ class _CylCard(QGroupBox):
                 else:
                     lbl.setText(f"{v:.3f}")
         except (ValueError, ZeroDivisionError, KeyError):
+            self._buoy_exact = None
             for v in self._res.values():
                 v.setText("---")
         if self._on_change:
             self._on_change()
 
     def buoyancy_sw(self) -> float | None:
-        try:
-            return float(self._res["buoyancy_sw"].text())
-        except ValueError:
-            return None
+        return self._buoy_exact
 
     def dry_mass(self) -> float | None:
         name = self._cyl_cb.currentText()
@@ -1238,6 +1239,7 @@ class _EquipRow(QWidget):
         self._db = db
         self._on_change = on_change
         self._choices_fn = choices_fn
+        self._buoy_exact: float | None = None
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -1296,6 +1298,7 @@ class _EquipRow(QWidget):
     def _recalc(self):
         name = self._cb.currentText()
         if name == "—":
+            self._buoy_exact = None
             self._dry_lbl.setText("---")
             self._buoy_lbl.setText("---")
             if self._on_change:
@@ -1309,7 +1312,6 @@ class _EquipRow(QWidget):
             lead = diver.get("lead_dry_mass") or 0
             diver_dry = diver.get("diver_dry_mass")
             r = _compute_diver(lead, diver_dry)
-            # Dry = diver body mass (not lead), empty if not set
             if diver_dry is not None:
                 self._dry_lbl.setText(f"{diver_dry:.2f}")
             else:
@@ -1325,14 +1327,17 @@ class _EquipRow(QWidget):
                             clothing_buoy += cr["buoyancy_sw"]
                         except (ValueError, TypeError):
                             pass
-            self._buoy_lbl.setText(f"{r['diver_buoyancy_sw'] + clothing_buoy:.2f}")
+            self._buoy_exact = r['diver_buoyancy_sw'] + clothing_buoy
+            self._buoy_lbl.setText(f"{self._buoy_exact:.2f}")
         elif equip:
             dry = equip.get("dry_mass") or 0
             wet = equip.get("wet_mass") or 0
             r = _compute_equip(dry, wet)
+            self._buoy_exact = r['buoyancy_sw']
             self._dry_lbl.setText(f"{dry:.2f}")
-            self._buoy_lbl.setText(f"{r['buoyancy_sw']:.2f}")
+            self._buoy_lbl.setText(f"{self._buoy_exact:.2f}")
         else:
+            self._buoy_exact = None
             self._dry_lbl.setText("---")
             self._buoy_lbl.setText("---")
 
@@ -1346,10 +1351,7 @@ class _EquipRow(QWidget):
             self._on_change()
 
     def buoyancy_sw(self) -> float | None:
-        try:
-            return float(self._buoy_lbl.text())
-        except ValueError:
-            return None
+        return self._buoy_exact
 
     def dry_mass(self) -> float | None:
         txt = self._dry_lbl.text()

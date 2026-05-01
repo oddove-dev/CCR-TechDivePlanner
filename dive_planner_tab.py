@@ -291,6 +291,8 @@ class DivePlannerTab(QWidget):
         self._bail_first_stop_depth = 0.0
         self._last_gf_low          = 0.30
         self._last_gf_high         = 0.80
+        self._last_bo_gf_low       = 0.30
+        self._last_bo_gf_high      = 0.80
         self._last_sim_args        = None   # cached for GF re-simulation
         self._dil_o2               = "—"   # diluent O2% read from buoyancy plan
         self._dil_he               = "—"   # diluent He% read from buoyancy plan
@@ -523,6 +525,8 @@ class DivePlannerTab(QWidget):
         ("Loop vol [L]",       "_ccr_loop_vol","7"),
         ("Metab O2 [L/min]",   "_ccr_o2_rate", "0.3"),
         ("Bailout time before ascent", "_bail_deco_time", "0"),
+        ("BO GF Low [%]",      "_bo_gf_lo",    "30"),
+        ("BO GF High [%]",     "_bo_gf_hi",    "80"),
     ]
     # Gas Correction tab — correction factors and one-time events
     _GAS_CORR_FIELDS = [
@@ -546,7 +550,7 @@ class DivePlannerTab(QWidget):
         """Build settings widget with General/Gas Correction tabs. Returns the QGroupBox."""
         box = QGroupBox("Settings")
         box.setMinimumWidth(480)
-        box.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding)
+        box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.MinimumExpanding)
 
         outer = QVBoxLayout(box)
         outer.setContentsMargins(8, 8, 8, 8)
@@ -556,52 +560,84 @@ class DivePlannerTab(QWidget):
         outer.addWidget(tabs)
 
         # ── General tab ──────────────────────────────────────────────────────
-        gen_w    = QWidget()
-        gen_grid = QGridLayout(gen_w)
-        gen_grid.setContentsMargins(8, 8, 8, 8)
-        gen_grid.setHorizontalSpacing(10)
-        gen_grid.setVerticalSpacing(4)
+        gen_w  = QWidget()
+        gen_hl = QHBoxLayout(gen_w)
+        gen_hl.setContentsMargins(6, 6, 6, 6)
+        gen_hl.setSpacing(6)
 
-        half = (len(self._GENERAL_FIELDS) + 1) // 2   # 8 rows per column
+        _GRP_STYLE = (
+            "QGroupBox { font-weight: bold; padding-top: 14px; margin-top: 4px; "
+            "border: 1px solid #bbbbbb; border-radius: 3px; } "
+            "QGroupBox::title { subcontrol-origin: margin; "
+            "subcontrol-position: top left; left: 6px; padding: 0 2px; }"
+        )
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.VLine)
-        sep.setStyleSheet("color:#cccccc;")
-        gen_grid.addWidget(sep, 0, 2, half, 1)
-        gen_grid.setColumnMinimumWidth(2, 8)
+        def _make_grp(title, fields):
+            grp = QGroupBox(title)
+            grp.setStyleSheet(_GRP_STYLE)
+            g = QGridLayout(grp)
+            g.setContentsMargins(6, 2, 6, 4)
+            g.setHorizontalSpacing(8)
+            g.setVerticalSpacing(3)
+            for r, (label, attr, default) in enumerate(fields):
+                lbl = QLabel(label + ":")
+                le  = QLineEdit(default)
+                le.setFixedWidth(60)
+                le.setAlignment(Qt.AlignmentFlag.AlignRight)
+                le.setStyleSheet(f"background:{CLR_INPUT};")
+                setattr(self, attr + "_le", le)
+                le.textChanged.connect(self._on_input_change)
+                g.addWidget(lbl, r, 0, Qt.AlignmentFlag.AlignLeft)
+                g.addWidget(le,  r, 1, Qt.AlignmentFlag.AlignRight)
+            return grp
 
-        for i, (label, attr, default) in enumerate(self._GENERAL_FIELDS):
-            row      = i if i < half else i - half
-            col_lbl  = 0 if i < half else 3
-            col_ent  = 1 if i < half else 4
-
-            lbl = QLabel(label + ":")
-            le  = QLineEdit(default)
-            le.setFixedWidth(60)
-            le.setAlignment(Qt.AlignmentFlag.AlignRight)
-            le.setStyleSheet(f"background:{CLR_INPUT};")
-            setattr(self, attr + "_le", le)
-            le.textChanged.connect(self._on_input_change)
-
-            gen_grid.addWidget(lbl, row, col_lbl, Qt.AlignmentFlag.AlignLeft)
-            gen_grid.addWidget(le,  row, col_ent, Qt.AlignmentFlag.AlignRight)
+        for grp in [
+            _make_grp("CCR", [
+                ("Descend SP [bar]",  "_sp_desc",      "0.7"),
+                ("Bottom SP [bar]",   "_sp",           "1.3"),
+                ("Deco SP [bar]",     "_sp_deco",      "1.6"),
+                ("Last stop [m]",     "_last_stop",    "3"),
+                ("Loop vol [L]",      "_ccr_loop_vol", "7"),
+                ("Metab O2 [L/min]",  "_ccr_o2_rate",  "0.3"),
+                ("GF Low [%]",        "_gf_lo",        "30"),
+                ("GF High [%]",       "_gf_hi",        "80"),
+            ]),
+            _make_grp("General", [
+                ("Descent [m/min]",   "_desc_r",   "20"),
+                ("Ascent [m/min]",    "_asc_r",    "9"),
+                ("Deco rate [m/min]", "_deco_r",   "3"),
+                ("SAC [L/min]",       "_sac",      "20"),
+            ]),
+            _make_grp("Bailout", [
+                ("BO deco sw SP [bar]",        "_deko_sw",        "1.6"),
+                ("Stop interval [m]",          "_stop_int",       "3"),
+                ("Display int [m]",            "_display_int",    "3"),
+                ("Bailout time before ascent", "_bail_deco_time", "0"),
+                ("BO GF Low [%]",              "_bo_gf_lo",       "30"),
+                ("BO GF High [%]",             "_bo_gf_hi",       "80"),
+            ]),
+        ]:
+            grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            gen_hl.addWidget(grp, stretch=1)
 
         tabs.addTab(gen_w, "General")
 
         # ── Gas Correction tab ───────────────────────────────────────────────
         tabs.addTab(self._build_gas_correction_tab(), "Gas Correction")
 
-        # ── Save button row (below tabs) ─────────────────────────────────────
-        btn_row = QHBoxLayout()
+        # ── Save button in tab bar corner ────────────────────────────────────
+        corner_w = QWidget()
+        corner_hl = QHBoxLayout(corner_w)
+        corner_hl.setContentsMargins(0, 0, 4, 0)
+        corner_hl.setSpacing(6)
         self._settings_status_lbl = QLabel("")
         self._settings_status_lbl.setStyleSheet("color:#44cc88; font-size:9px;")
         save_btn = QPushButton("Save settings")
         save_btn.setStyleSheet("background:#2a5a2a; color:white; font-weight:bold; padding:3px 8px;")
         save_btn.clicked.connect(self._save_global_settings)
-        btn_row.addStretch()
-        btn_row.addWidget(self._settings_status_lbl)
-        btn_row.addWidget(save_btn)
-        outer.addLayout(btn_row)
+        corner_hl.addWidget(self._settings_status_lbl)
+        corner_hl.addWidget(save_btn)
+        tabs.setCornerWidget(corner_w, Qt.Corner.TopRightCorner)
 
         return box
 
@@ -1278,18 +1314,18 @@ class DivePlannerTab(QWidget):
         tab1.layout().setContentsMargins(0, 0, 0, 0)
         self._chart_tabs.addTab(tab1, "Dive profile")
 
-        # Tab 3 — Tissue Saturations (CCR + Bailout side by side)
-        tissue_tab = QWidget()
-        tissue_hl  = QHBoxLayout(tissue_tab)
-        tissue_hl.setContentsMargins(4, 4, 4, 4)
-        tissue_hl.setSpacing(6)
-        tissue_hl.addWidget(self._build_ccr_tissue_sat())
-        tissue_hl.addWidget(self._build_bail_tissue_sat())
-        self._chart_tabs.addTab(tissue_tab, "Tissue saturations")
-
         self._tissue_canvas = None  # no longer an inline tab — opened via popup
 
-        # Tab 3 — Gas consumption
+        # CCR Gas consumption
+        fig4 = _Figure(figsize=(4, 2.2), facecolor="#1a1a2e")
+        fig4.subplots_adjust(left=0.10, right=0.97, top=0.88, bottom=0.22)
+        self._ccr_gas_canvas = _FigCanvas(fig4)
+        tab4 = QWidget()
+        QVBoxLayout(tab4).addWidget(self._ccr_gas_canvas)
+        tab4.layout().setContentsMargins(0, 0, 0, 0)
+        self._chart_tabs.addTab(tab4, "CCR Gas consumption")
+
+        # BO Gas consumption
         fig3 = _Figure(figsize=(4, 2.2), facecolor="#1a1a2e")
         fig3.subplots_adjust(left=0.10, right=0.97, top=0.88, bottom=0.22)
         self._gas_canvas = _FigCanvas(fig3)
@@ -1298,14 +1334,14 @@ class DivePlannerTab(QWidget):
         tab3.layout().setContentsMargins(0, 0, 0, 0)
         self._chart_tabs.addTab(tab3, "BO Gas consumption")
 
-        # Tab 4 — CCR Gas consumption
-        fig4 = _Figure(figsize=(4, 2.2), facecolor="#1a1a2e")
-        fig4.subplots_adjust(left=0.10, right=0.97, top=0.88, bottom=0.22)
-        self._ccr_gas_canvas = _FigCanvas(fig4)
-        tab4 = QWidget()
-        QVBoxLayout(tab4).addWidget(self._ccr_gas_canvas)
-        tab4.layout().setContentsMargins(0, 0, 0, 0)
-        self._chart_tabs.addTab(tab4, "CCR Gas consumption")
+        # Tissue Saturations (CCR + Bailout side by side)
+        tissue_tab = QWidget()
+        tissue_hl  = QHBoxLayout(tissue_tab)
+        tissue_hl.setContentsMargins(4, 4, 4, 4)
+        tissue_hl.setSpacing(6)
+        tissue_hl.addWidget(self._build_ccr_tissue_sat())
+        tissue_hl.addWidget(self._build_bail_tissue_sat())
+        self._chart_tabs.addTab(tissue_tab, "Tissue saturations")
 
         outer_hl.addWidget(self._chart_tabs, stretch=1)
         outer_hl.setContentsMargins(0, 0, 0, 0)
@@ -2572,10 +2608,12 @@ class DivePlannerTab(QWidget):
             phase_list = self._bail_phase_list if bailout else self._tissue_phase_list
             first_stop = (self._bail_first_stop_depth if bailout
                           else self._ccr_first_stop_depth)
+            gf_low  = self._last_bo_gf_low  if bailout else self._last_gf_low
+            gf_high = self._last_bo_gf_high if bailout else self._last_gf_high
             win = TissueHeatmapWindow(
                 self, timeline, surface_mv=surface_mv, title=label,
                 stops=stops, phase_list=phase_list,
-                gf_low=self._last_gf_low, gf_high=self._last_gf_high,
+                gf_low=gf_low, gf_high=gf_high,
                 resimulate_fn=None if bailout else self.resimulate_with_gf,
                 first_stop_depth=first_stop,
                 single_tab=tab,
@@ -2807,15 +2845,20 @@ class DivePlannerTab(QWidget):
                 active_sslots.append((si, s, cyl))
 
         for row in self._gas_rows:
+            # Always append one entry per row so stage_tracking stays parallel
+            # to self._gas_rows and slot indices remain correct in the chart.
             if not row.get("active", True):
+                stage_tracking.append(None)
                 continue
             sel = row["stage_cb"].currentText()
             if sel == "—":
+                stage_tracking.append(None)
                 continue
             o2 = row.get("o2", 0) / 100.0
             he = row.get("he", 0) / 100.0
             sw = _flt(row["sw_le"].text(), 999)
             if o2 <= 0:
+                stage_tracking.append(None)
                 continue
             oc_gas = OCGas(o2=o2, he=he, switch_depth=sw)
             oc_gases.append(oc_gas)
@@ -2860,8 +2903,10 @@ class DivePlannerTab(QWidget):
         if not oc_gases:
             oc_gases = [OCGas(o2=0.21, he=0.0, switch_depth=999)]
 
-        gf_lo  = self._get_setting("_gf_lo", 30) / 100
-        gf_hi  = self._get_setting("_gf_hi", 80) / 100
+        gf_lo    = self._get_setting("_gf_lo",    30) / 100
+        gf_hi    = self._get_setting("_gf_hi",    80) / 100
+        bo_gf_lo = self._get_setting("_bo_gf_lo", 30) / 100
+        bo_gf_hi = self._get_setting("_bo_gf_hi", 80) / 100
         desc_r = self._get_setting("_desc_r", 20)
         asc_r  = self._get_setting("_asc_r",  9)
         deco_r = self._get_setting("_deco_r",  3)
@@ -2937,7 +2982,10 @@ class DivePlannerTab(QWidget):
             onboard_cylvols.append(cylvol_v)
 
         if plan_state_bp:
-            ccr_buoy = _compute_buoyancy_from_plan(self._db, plan_state_bp, T_c)
+            try:
+                ccr_buoy = float(self._bp_tab._sum_lbls["jj_diver_stages"].text())
+            except (ValueError, KeyError, AttributeError):
+                ccr_buoy = None
             ccr_buoy_str = f"{ccr_buoy:+.2f}" if ccr_buoy is not None else "—"
         else:
             ccr_buoy = None
@@ -3204,7 +3252,7 @@ class DivePlannerTab(QWidget):
                 bail_segments = segments  # full CCR bottom time for deco loading
                 bail = simulate_bailout_from_bottom(
                     segments=bail_segments, ccr=ccr, oc_gases=oc_gases,
-                    gf_low=gf_lo, gf_high=gf_hi,
+                    gf_low=bo_gf_lo, gf_high=bo_gf_hi,
                     desc_rate=desc_r, asc_rate=asc_r, deco_rate=deco_r,
                     snap_interval=max(0.1, self._get_setting("_heatmap_int", 1.0)),
                     stop_interval=max(1.0, self._get_setting("_stop_int", 3.0)),
@@ -3229,6 +3277,8 @@ class DivePlannerTab(QWidget):
                 self._bail_phase_list       = bail.tissue_phase_list
                 self._bail_first_stop_depth = bail.first_stop_depth
                 self._bail_saved_stops      = bail_stops
+                self._last_bo_gf_low        = bo_gf_lo
+                self._last_bo_gf_high       = bo_gf_hi
                 bail_total_runtime          = bail.runtime + _bail_rt_offset
             except Exception as e:
                 self._bail_summary_lbl.setText(f"Error: {e}")
@@ -3607,6 +3657,7 @@ class DivePlannerTab(QWidget):
                 _cum_at[_i] = _cum_used
 
             # Pass 2: assign display values
+            _first_gas_seen = False   # True after the bailout gas @-depth row
             for _i in range(_n):
                 _row = _dl[_i]
                 if _row.get("_drop_marker") or not _row.get("gas") or _i >= len(bail_extra):
@@ -3617,14 +3668,31 @@ class DivePlannerTab(QWidget):
                 _is_first = _g != _prev_gas
                 _is_last  = _g != _next_gas
                 ex = list(bail_extra[_i])
+
+                # For gas switches (not the bailout-gas entry row which already
+                # stores snap_pres), reconstruct initial pressure = pres_after + used.
+                _init_press_str = None
+                if _is_first and _first_gas_seen:
+                    try:
+                        _p_after = float(ex[1][0])
+                        _used_f  = float(ex[2][0])
+                        _init_press_str = f"{_p_after + _used_f:.0f}"
+                    except (ValueError, TypeError):
+                        pass
+
                 if _is_first or _is_last:
+                    # Mark as gas boundary so _render_stops always shows this row
+                    _dl[_i]["_gas_boundary"] = True
                     if _is_last:
                         ex[2] = (f"{_cum_at.get(_i, 0.0):.0f}", ex[2][1], ex[2][2])
-                    # first row: keep original per-row used value unchanged
+                    if _init_press_str is not None:
+                        ex[1] = (_init_press_str, ex[1][1], ex[1][2])
                 else:
                     ex[1] = ("—", ex[1][1], ex[1][2])   # Press[bar]
                     ex[2] = ("—", ex[2][1], ex[2][2])   # Used[bar]
                 bail_extra[_i] = ex
+                if _is_first:
+                    _first_gas_seen = True
 
         self._render_stops(display_list, self._bail_table_area,
                            extra_data=bail_extra, has_pre_gas=False)
@@ -3692,7 +3760,7 @@ class DivePlannerTab(QWidget):
         filtered_pairs = [
             (s, extra_data[i] if (extra_data and i < len(extra_data)) else [])
             for i, s in enumerate(stops)
-            if s.get("_drop_marker") or s.get("_label")
+            if s.get("_drop_marker") or s.get("_label") or s.get("_gas_boundary")
             or (round(s.get("depth", 0)) % disp_int == 0)
         ]
         stops      = [p[0] for p in filtered_pairs]
