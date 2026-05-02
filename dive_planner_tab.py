@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QAbstractItemView, QCheckBox, QComboBox, QSpacerItem, QTabWidget,
     QMessageBox,
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 
 from cylindercalc import z_mix, calc_gas_mass, RHO_SW, RHO_FW, RHO_PB
@@ -263,6 +263,94 @@ def _lbl_hdr(text: str) -> QLabel:
     return lbl
 
 
+# ── Background simulation worker ─────────────────────────────────────────────
+
+class _SimWorker(QThread):
+    """Runs Bühlmann CCR + bailout simulations off the UI thread."""
+    done = pyqtSignal(dict)
+
+    def __init__(self, params: dict, parent=None):
+        super().__init__(parent)
+        self._p         = params
+        self._cancelled = False
+
+    def run(self):
+        p   = self._p
+        out = {"params": p}
+
+        # CCR simulation
+        try:
+            out["result"] = simulate_dive(
+                segments      = p["segments"],
+                mode          = "ccr",
+                ccr           = p["ccr"],
+                oc_gases      = p["oc_gases"],
+                gf_low        = p["gf_lo"],
+                gf_high       = p["gf_hi"],
+                desc_rate     = p["desc_r"],
+                asc_rate      = p["asc_r"],
+                deco_rate     = p["deco_r"],
+                snap_interval = p["snap_iv"],
+                stop_interval = p["stop_iv"],
+                last_stop     = p["last_stop"],
+            )
+        except Exception as e:
+            out["result"]    = None
+            out["error_ccr"] = str(e)
+
+        if self._cancelled:
+            return
+
+        out["ccr_bottom_rt"] = self._ccr_bottom_rt(p)
+
+        # Bailout simulation
+        if p["oc_gases"]:
+            try:
+                out["bail"] = simulate_bailout_from_bottom(
+                    segments      = p["segments"],
+                    ccr           = p["ccr"],
+                    oc_gases      = p["oc_gases"],
+                    gf_low        = p["bo_gf_lo"],
+                    gf_high       = p["bo_gf_hi"],
+                    desc_rate     = p["desc_r"],
+                    asc_rate      = p["asc_r"],
+                    deco_rate     = p["deco_r"],
+                    snap_interval = p["snap_iv"],
+                    stop_interval = p["stop_iv"],
+                    bail_extra    = p["bail_extra"],
+                )
+            except Exception as e:
+                out["bail"]       = None
+                out["error_bail"] = str(e)
+        else:
+            out["bail"] = None
+
+        if not self._cancelled:
+            self.done.emit(out)
+
+    @staticmethod
+    def _ccr_bottom_rt(p: dict) -> float:
+        """Runtime at the end of the deepest segment (needed for bailout RT offset)."""
+        segments = p["segments"]
+        desc_r   = p["desc_r"]
+        asc_r    = p["asc_r"]
+        _max_d   = max((d for d, _ in segments), default=0.0)
+        cur_d, cur_rt, ccr_bottom_rt = 0.0, 0.0, 0.0
+        for seg_depth, total_seg_time in segments:
+            if seg_depth != cur_d:
+                rate     = desc_r if seg_depth > cur_d else asc_r
+                t_travel = abs(seg_depth - cur_d) / rate
+                cur_rt  += t_travel
+                cur_d    = seg_depth
+            else:
+                t_travel = 0.0
+            t_at    = max(0.0, total_seg_time - t_travel)
+            cur_rt += t_at
+            if seg_depth >= _max_d:
+                ccr_bottom_rt = cur_rt
+        return ccr_bottom_rt
+
+
 # ── DivePlannerTab ────────────────────────────────────────────────────────────
 
 class DivePlannerTab(QWidget):
@@ -280,6 +368,7 @@ class DivePlannerTab(QWidget):
         self._calc_timer      = QTimer(self)
         self._calc_timer.setSingleShot(True)
         self._calc_timer.timeout.connect(self._recalc_and_run)
+        self._sim_worker: _SimWorker | None = None
         self._saved_stops           = []
         self._bail_stops_data       = []
         self._bail_saved_stops      = []
@@ -579,12 +668,17 @@ class DivePlannerTab(QWidget):
             g.setContentsMargins(6, 2, 6, 4)
             g.setHorizontalSpacing(8)
             g.setVerticalSpacing(3)
-            for r, (label, attr, default) in enumerate(fields):
+            for r, row in enumerate(fields):
+                label, attr, default = row[0], row[1], row[2]
+                tip = row[3] if len(row) > 3 else ""
                 lbl = QLabel(label + ":")
                 le  = QLineEdit(default)
                 le.setFixedWidth(60)
                 le.setAlignment(Qt.AlignmentFlag.AlignRight)
                 le.setStyleSheet(f"background:{CLR_INPUT};")
+                if tip:
+                    lbl.setToolTip(tip)
+                    le.setToolTip(tip)
                 setattr(self, attr + "_le", le)
                 le.textChanged.connect(self._on_input_change)
                 g.addWidget(lbl, r, 0, Qt.AlignmentFlag.AlignLeft)
@@ -593,28 +687,77 @@ class DivePlannerTab(QWidget):
 
         for grp in [
             _make_grp("CCR", [
-                ("Descend SP [bar]",  "_sp_desc",      "0.7"),
-                ("Bottom SP [bar]",   "_sp",           "1.3"),
-                ("Deco SP [bar]",     "_sp_deco",      "1.6"),
-                ("Last stop [m]",     "_last_stop",    "3"),
-                ("Loop vol [L]",      "_ccr_loop_vol", "7"),
-                ("Metab O2 [L/min]",  "_ccr_o2_rate",  "0.3"),
-                ("GF Low [%]",        "_gf_lo",        "30"),
-                ("GF High [%]",       "_gf_hi",        "80"),
+                ("Descend SP [bar]",  "_sp_desc",      "0.7",
+                 "O₂ partial pressure setpoint during descent.\n"
+                 "The CCR maintains this PPO₂ while going to depth.\n"
+                 "Typical: 0.7 bar (reduces O₂ toxicity risk on descent)."),
+                ("Bottom SP [bar]",   "_sp",           "1.3",
+                 "O₂ partial pressure setpoint at bottom depth.\n"
+                 "Higher SP → lower inert gas fraction → less decompression.\n"
+                 "Typical: 1.2–1.3 bar."),
+                ("Deco SP [bar]",     "_sp_deco",      "1.6",
+                 "O₂ partial pressure setpoint during decompression stops.\n"
+                 "Higher SP accelerates deco but increases CNS O₂ loading.\n"
+                 "Typical: 1.6 bar (NOAA CNS limit)."),
+                ("Last stop [m]",     "_last_stop",    "3",
+                 "Depth of the shallowest decompression stop before surfacing.\n"
+                 "Typical: 3–6 m. Shallower = more conservative."),
+                ("Loop vol [L]",      "_ccr_loop_vol", "7",
+                 "Volume of the CCR breathing loop (mouthpiece + hoses + scrubber).\n"
+                 "Used to calculate diluent consumed when flushing the loop at depth.\n"
+                 "Typical JJ-CCR: 7 L."),
+                ("Metab O2 [L/min]",  "_ccr_o2_rate",  "0.3",
+                 "Oxygen metabolic consumption rate at rest / light work.\n"
+                 "Used to estimate O₂ cylinder usage during the dive.\n"
+                 "Typical resting value: 0.3 L/min."),
+                ("GF Low [%]",        "_gf_lo",        "30",
+                 "Gradient Factor Low — controls the depth of the first deco stop.\n"
+                 "Lower value = deeper first stop = more conservative.\n"
+                 "Buhlmann ZHL-16C parameter. Typical: 30–50 %."),
+                ("GF High [%]",       "_gf_hi",        "80",
+                 "Gradient Factor High — controls allowed supersaturation at the surface.\n"
+                 "Lower value = more conservative surface ceiling.\n"
+                 "Buhlmann ZHL-16C parameter. Typical: 70–85 %."),
             ]),
             _make_grp("General", [
-                ("Descent [m/min]",   "_desc_r",   "20"),
-                ("Ascent [m/min]",    "_asc_r",    "9"),
-                ("Deco rate [m/min]", "_deco_r",   "3"),
-                ("SAC [L/min]",       "_sac",      "20"),
+                ("Descent [m/min]",   "_desc_r",   "20",
+                 "Rate of descent from surface to target depth.\n"
+                 "Typical: 20 m/min."),
+                ("Ascent [m/min]",    "_asc_r",    "9",
+                 "Rate of ascent from bottom to the first decompression stop.\n"
+                 "Typical: 9–10 m/min (PADI/DSAT standard)."),
+                ("Deco rate [m/min]", "_deco_r",   "3",
+                 "Rate of ascent between decompression stops.\n"
+                 "Slower than the main ascent rate to allow controlled off-gassing.\n"
+                 "Typical: 3–10 m/min."),
+                ("SAC [L/min]",       "_sac",      "20",
+                 "Surface Air Consumption — breathing rate normalised to 1 bar.\n"
+                 "Actual consumption at depth = SAC × (depth/10 + 1).\n"
+                 "Used to calculate OC bailout gas usage. Typical: 15–25 L/min."),
             ]),
             _make_grp("Bailout", [
-                ("BO deco sw SP [bar]",        "_deko_sw",        "1.6"),
-                ("Stop interval [m]",          "_stop_int",       "3"),
-                ("Display int [m]",            "_display_int",    "3"),
-                ("Bailout time before ascent", "_bail_deco_time", "0"),
-                ("BO GF Low [%]",              "_bo_gf_lo",       "30"),
-                ("BO GF High [%]",             "_bo_gf_hi",       "80"),
+                ("BO deco sw SP [bar]",        "_deko_sw",        "1.6",
+                 "CCR setpoint used if switching back to CCR during bailout deco stops.\n"
+                 "Only relevant if deco is completed on CCR after OC bailout."),
+                ("Stop interval [m]",          "_stop_int",       "3",
+                 "Depth interval between computed decompression stops.\n"
+                 "1 m = fine resolution, 3 m = standard DSAT schedule."),
+                ("Display int [m]",            "_display_int",    "3",
+                 "Controls which stop depths are shown in the table.\n"
+                 "Set to 1 to see every metre, 3 to see every 3 m.\n"
+                 "Gas switch rows and surface are always shown."),
+                ("Bailout time before ascent", "_bail_deco_time", "0",
+                 "Extra minutes spent at bottom depth on open circuit before ascending.\n"
+                 "Simulates time needed to assess the situation and prepare for bailout.\n"
+                 "This gas is consumed from the bailout cylinder."),
+                ("BO GF Low [%]",              "_bo_gf_lo",       "30",
+                 "Gradient Factor Low for the bailout decompression plan.\n"
+                 "Can be set higher (less conservative) than the CCR GF Low\n"
+                 "for a faster emergency ascent. Buhlmann ZHL-16C parameter."),
+                ("BO GF High [%]",             "_bo_gf_hi",       "80",
+                 "Gradient Factor High for the bailout decompression plan.\n"
+                 "Can be set higher (less conservative) than the CCR GF High\n"
+                 "for a faster emergency ascent. Buhlmann ZHL-16C parameter."),
             ]),
         ]:
             grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -2823,7 +2966,7 @@ class DivePlannerTab(QWidget):
 
         # ── OC gases and stage tracking ──────────────────────────────────────
         oc_gases       = []
-        stage_tracking = []   # parallel list, entry per oc_gas
+        stage_tracking = []
         T_c            = TEMP_C_DEFAULT
         plan_name      = self._stage_plan_cb.currentText()
         user_now       = self._bp_tab._current_user()
@@ -2832,7 +2975,6 @@ class DivePlannerTab(QWidget):
             plan_state_bp = (self._db["users"][user_now]
                              .get("buoyancy_plans", {}).get(plan_name))
 
-        # Active sslots
         active_sslots = []
         if plan_state_bp:
             for si, s in enumerate(plan_state_bp.get("sslots", [])):
@@ -2845,8 +2987,6 @@ class DivePlannerTab(QWidget):
                 active_sslots.append((si, s, cyl))
 
         for row in self._gas_rows:
-            # Always append one entry per row so stage_tracking stays parallel
-            # to self._gas_rows and slot indices remain correct in the chart.
             if not row.get("active", True):
                 stage_tracking.append(None)
                 continue
@@ -2907,23 +3047,67 @@ class DivePlannerTab(QWidget):
         gf_hi    = self._get_setting("_gf_hi",    80) / 100
         bo_gf_lo = self._get_setting("_bo_gf_lo", 30) / 100
         bo_gf_hi = self._get_setting("_bo_gf_hi", 80) / 100
-        desc_r = self._get_setting("_desc_r", 20)
-        asc_r  = self._get_setting("_asc_r",  9)
-        deco_r = self._get_setting("_deco_r",  3)
-
-        # ── CCR simulation ───────────────────────────────────────────────────
+        desc_r   = self._get_setting("_desc_r", 20)
+        asc_r    = self._get_setting("_asc_r",  9)
+        deco_r   = self._get_setting("_deco_r",  3)
         _snap_iv   = max(0.1, self._get_setting("_heatmap_int", 1.0))
         _stop_iv   = max(1.0, self._get_setting("_stop_int",    3.0))
         _last_stop = max(0.0, self._get_setting("_last_stop",   3.0))
-        result = None
-        try:
-            result = simulate_dive(
-                segments=segments, mode="ccr", ccr=ccr, oc_gases=oc_gases,
-                gf_low=gf_lo, gf_high=gf_hi,
-                desc_rate=desc_r, asc_rate=asc_r, deco_rate=deco_r,
-                snap_interval=_snap_iv, stop_interval=_stop_iv,
-                last_stop=_last_stop,
-            )
+        _bail_extra = max(0.0, self._get_setting("_bail_deco_time", 0.0))
+
+        sim_params = {
+            "segments":       segments,
+            "ccr":            ccr,
+            "oc_gases":       oc_gases,
+            "stage_tracking": stage_tracking,
+            "plan_state_bp":  plan_state_bp,
+            "gf_lo":          gf_lo,
+            "gf_hi":          gf_hi,
+            "bo_gf_lo":       bo_gf_lo,
+            "bo_gf_hi":       bo_gf_hi,
+            "desc_r":         desc_r,
+            "asc_r":          asc_r,
+            "deco_r":         deco_r,
+            "snap_iv":        _snap_iv,
+            "stop_iv":        _stop_iv,
+            "last_stop":      _last_stop,
+            "bail_extra":     _bail_extra,
+        }
+
+        # Cancel any still-running calculation before starting the new one
+        if self._sim_worker and self._sim_worker.isRunning():
+            self._sim_worker._cancelled = True
+
+        self._ccr_summary_lbl.setText("Calculating…")
+        self._bail_summary_lbl.setText("Calculating…")
+
+        self._sim_worker = _SimWorker(sim_params)
+        self._sim_worker.done.connect(self._do_run)
+        self._sim_worker.start()
+
+    def _do_run(self, r: dict):
+        # ── Unpack simulation results and parameters ─────────────────────────
+        p             = r["params"]
+        segments      = p["segments"]
+        ccr           = p["ccr"]
+        oc_gases      = p["oc_gases"]
+        stage_tracking= p["stage_tracking"]
+        plan_state_bp = p["plan_state_bp"]
+        gf_lo         = p["gf_lo"]
+        gf_hi         = p["gf_hi"]
+        bo_gf_lo      = p["bo_gf_lo"]
+        bo_gf_hi      = p["bo_gf_hi"]
+        desc_r        = p["desc_r"]
+        asc_r         = p["asc_r"]
+        deco_r        = p["deco_r"]
+        _snap_iv      = p["snap_iv"]
+        _stop_iv      = p["stop_iv"]
+        _last_stop    = p["last_stop"]
+        T_c           = TEMP_C_DEFAULT
+
+        # ── CCR simulation results ────────────────────────────────────────────
+        result = r.get("result")
+        if result is not None:
             self._ccr_summary_lbl.setText(
                 f"Bottom time: {result.bottom_time:.0f} min  |  "
                 f"TTS: {result.tts:.0f} min  |  "
@@ -2935,24 +3119,23 @@ class DivePlannerTab(QWidget):
                  "gas": s.gas, "tissue": s.tissue_snapshot}
                 for s in result.stops
             ]
-            self._tissue_timeline     = result.tissue_timeline
-            self._tissue_phase_list   = result.tissue_phase_list
+            self._tissue_timeline      = result.tissue_timeline
+            self._tissue_phase_list    = result.tissue_phase_list
             self._ccr_first_stop_depth = result.first_stop_depth
-            self._last_gf_low       = gf_lo
-            self._last_gf_high      = gf_hi
-            # cache args for GF re-simulation from tissue window
+            self._last_gf_low          = gf_lo
+            self._last_gf_high         = gf_hi
             self._last_sim_args = dict(
                 segments=segments, mode="ccr", ccr=ccr, oc_gases=oc_gases,
                 desc_rate=desc_r, asc_rate=asc_r, deco_rate=deco_r,
                 snap_interval=_snap_iv, stop_interval=_stop_iv,
                 last_stop=_last_stop,
             )
-        except Exception as e:
-            self._ccr_summary_lbl.setText(f"Error: {e}")
+        else:
+            self._ccr_summary_lbl.setText(
+                f"Error: {r.get('error_ccr', 'simulation failed')}")
             self._saved_stops       = []
             self._tissue_timeline   = []
             self._tissue_phase_list = []
-            result = None
 
         # ── Onboard gas volumes ──────────────────────────────────────────────
         onboard_pres, onboard_vols, onboard_cylvols = [], [], []
@@ -3242,24 +3425,15 @@ class DivePlannerTab(QWidget):
                            extra_data=ccr_extra if ccr_extra else None,
                            has_pre_gas=True)
 
-        # ── Bailout simulation ───────────────────────────────────────────────
+        # ── Bailout simulation results ────────────────────────────────────────
         bail_stops = []
         bail_total_runtime = None
+        _bail_extra   = p["bail_extra"]
+        bail_segments = segments
+        self._bail_extra_chart = _bail_extra
         if oc_gases:
-            try:
-                _bail_extra = max(0.0, self._get_setting("_bail_deco_time", 0.0))
-                self._bail_extra_chart = _bail_extra  # for profile chart time correction
-                bail_segments = segments  # full CCR bottom time for deco loading
-                bail = simulate_bailout_from_bottom(
-                    segments=bail_segments, ccr=ccr, oc_gases=oc_gases,
-                    gf_low=bo_gf_lo, gf_high=bo_gf_hi,
-                    desc_rate=desc_r, asc_rate=asc_r, deco_rate=deco_r,
-                    snap_interval=max(0.1, self._get_setting("_heatmap_int", 1.0)),
-                    stop_interval=max(1.0, self._get_setting("_stop_int", 3.0)),
-                    bail_extra=_bail_extra,
-                )
-                # Offset: align simulation runtimes to CCR display runtime.
-                # bail_extra OC time at depth is now IN the simulation, so add it to _sim_bottom_exit.
+            bail = r.get("bail")
+            if bail is not None:
                 _sim_bottom_exit = sum(t for _, t in bail_segments) + _bail_extra
                 _bail_rt_offset  = ccr_bottom_rt - _sim_bottom_exit
                 self._bail_summary_lbl.setText(
@@ -3280,9 +3454,9 @@ class DivePlannerTab(QWidget):
                 self._last_bo_gf_low        = bo_gf_lo
                 self._last_bo_gf_high       = bo_gf_hi
                 bail_total_runtime          = bail.runtime + _bail_rt_offset
-            except Exception as e:
-                self._bail_summary_lbl.setText(f"Error: {e}")
-                bail_stops                  = []
+            else:
+                self._bail_summary_lbl.setText(
+                    f"Error: {r.get('error_bail', 'simulation failed')}")
                 self._bail_tissue_timeline  = []
                 self._bail_phase_list       = []
                 self._bail_first_stop_depth = 0.0
