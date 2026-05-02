@@ -306,8 +306,20 @@ class _SimWorker(QThread):
         # Bailout simulation
         if p["oc_gases"]:
             try:
+                _be = p["bail_extra"]
+                _bail_ascend_now = p.get("bail_ascend_now", False)
+                _bail_segs = list(p["segments"])
+                if _be > 0.0 and _bail_segs:
+                    _max_d = max((d for d, _ in _bail_segs), default=0.0)
+                    for _bi in range(len(_bail_segs) - 1, -1, -1):
+                        _bd, _bt = _bail_segs[_bi]
+                        if _bd >= _max_d:
+                            _bail_segs[_bi] = (_bd, max(0.0, _bt - _be))
+                            break
+                # "Ascend immediately": no OC time at depth, start ascending at bailout point
+                _sim_bail_extra = 0.0 if _bail_ascend_now else _be
                 out["bail"] = simulate_bailout_from_bottom(
-                    segments      = p["segments"],
+                    segments      = _bail_segs,
                     ccr           = p["ccr"],
                     oc_gases      = p["oc_gases"],
                     gf_low        = p["bo_gf_lo"],
@@ -317,7 +329,7 @@ class _SimWorker(QThread):
                     deco_rate     = p["deco_r"],
                     snap_interval = p["snap_iv"],
                     stop_interval = p["stop_iv"],
-                    bail_extra    = p["bail_extra"],
+                    bail_extra    = _sim_bail_extra,
                 )
             except Exception as e:
                 out["bail"]       = None
@@ -613,7 +625,7 @@ class DivePlannerTab(QWidget):
         ("Display int [m]",    "_display_int", "3"),
         ("Loop vol [L]",       "_ccr_loop_vol","7"),
         ("Metab O2 [L/min]",   "_ccr_o2_rate", "0.3"),
-        ("Bailout time before ascent", "_bail_deco_time", "0"),
+        ("Bailout time before CCR ascent", "_bail_deco_time", "0"),
         ("BO GF Low [%]",      "_bo_gf_lo",    "30"),
         ("BO GF High [%]",     "_bo_gf_hi",    "80"),
     ]
@@ -735,33 +747,72 @@ class DivePlannerTab(QWidget):
                  "Actual consumption at depth = SAC × (depth/10 + 1).\n"
                  "Used to calculate OC bailout gas usage. Typical: 15–25 L/min."),
             ]),
-            _make_grp("Bailout", [
-                ("BO deco sw SP [bar]",        "_deko_sw",        "1.6",
-                 "CCR setpoint used if switching back to CCR during bailout deco stops.\n"
-                 "Only relevant if deco is completed on CCR after OC bailout."),
-                ("Stop interval [m]",          "_stop_int",       "3",
-                 "Depth interval between computed decompression stops.\n"
-                 "1 m = fine resolution, 3 m = standard DSAT schedule."),
-                ("Display int [m]",            "_display_int",    "3",
-                 "Controls which stop depths are shown in the table.\n"
-                 "Set to 1 to see every metre, 3 to see every 3 m.\n"
-                 "Gas switch rows and surface are always shown."),
-                ("Bailout time before ascent", "_bail_deco_time", "0",
-                 "Extra minutes spent at bottom depth on open circuit before ascending.\n"
-                 "Simulates time needed to assess the situation and prepare for bailout.\n"
-                 "This gas is consumed from the bailout cylinder."),
-                ("BO GF Low [%]",              "_bo_gf_lo",       "30",
-                 "Gradient Factor Low for the bailout decompression plan.\n"
-                 "Can be set higher (less conservative) than the CCR GF Low\n"
-                 "for a faster emergency ascent. Buhlmann ZHL-16C parameter."),
-                ("BO GF High [%]",             "_bo_gf_hi",       "80",
-                 "Gradient Factor High for the bailout decompression plan.\n"
-                 "Can be set higher (less conservative) than the CCR GF High\n"
-                 "for a faster emergency ascent. Buhlmann ZHL-16C parameter."),
-            ]),
         ]:
             grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             gen_hl.addWidget(grp, stretch=1)
+
+        # Bailout group — built manually to insert checkbox row in the right position
+        _bail_grp = QGroupBox("Bailout")
+        _bail_grp.setStyleSheet(_GRP_STYLE)
+        _bail_g = QGridLayout(_bail_grp)
+        _bail_g.setContentsMargins(6, 2, 6, 4)
+        _bail_g.setHorizontalSpacing(8)
+        _bail_g.setVerticalSpacing(3)
+
+        _bail_rows = [
+            ("BO deco sw SP [bar]",           "_deko_sw",        "1.6",
+             "CCR setpoint used if switching back to CCR during bailout deco stops.\n"
+             "Only relevant if deco is completed on CCR after OC bailout."),
+            ("Stop interval [m]",             "_stop_int",       "3",
+             "Depth interval between computed decompression stops.\n"
+             "1 m = fine resolution, 3 m = standard DSAT schedule."),
+            ("Display int [m]",               "_display_int",    "3",
+             "Controls which stop depths are shown in the table.\n"
+             "Set to 1 to see every metre, 3 to see every 3 m.\n"
+             "Gas switch rows and surface are always shown."),
+            ("Bailout time before CCR ascent", "_bail_deco_time", "0",
+             "Minutes before the planned CCR ascent at which the diver switches to OC.\n"
+             "CCR bottom time is shortened by this amount; those minutes are spent on\n"
+             "open circuit at depth before ascending. Total bottom time is unchanged."),
+            # checkbox injected here (row 4)
+            ("BO GF Low [%]",                 "_bo_gf_lo",       "30",
+             "Gradient Factor Low for the bailout decompression plan.\n"
+             "Can be set higher (less conservative) than the CCR GF Low\n"
+             "for a faster emergency ascent. Buhlmann ZHL-16C parameter."),
+            ("BO GF High [%]",                "_bo_gf_hi",       "80",
+             "Gradient Factor High for the bailout decompression plan.\n"
+             "Can be set higher (less conservative) than the CCR GF High\n"
+             "for a faster emergency ascent. Buhlmann ZHL-16C parameter."),
+        ]
+        _CB_INSERT = 4   # row index where checkbox is inserted
+        for r, row in enumerate(_bail_rows):
+            _gr = r if r < _CB_INSERT else r + 1   # shift rows after checkbox down by 1
+            label, attr, default = row[0], row[1], row[2]
+            tip = row[3] if len(row) > 3 else ""
+            lbl = QLabel(label + ":")
+            le  = QLineEdit(default)
+            le.setFixedWidth(60)
+            le.setAlignment(Qt.AlignmentFlag.AlignRight)
+            le.setStyleSheet(f"background:{CLR_INPUT};")
+            if tip:
+                lbl.setToolTip(tip); le.setToolTip(tip)
+            setattr(self, attr + "_le", le)
+            le.textChanged.connect(self._on_input_change)
+            _bail_g.addWidget(lbl, _gr, 0, Qt.AlignmentFlag.AlignLeft)
+            _bail_g.addWidget(le,  _gr, 1, Qt.AlignmentFlag.AlignRight)
+
+        _cb_lbl = QLabel("Ascend immediately:")
+        _cb_tip = ("When ticked, the diver starts the OC ascent immediately at the bailout\n"
+                   "point. No time is spent at depth on OC before ascending.")
+        _cb_lbl.setToolTip(_cb_tip)
+        self._bail_ascend_now_cb = QCheckBox()
+        self._bail_ascend_now_cb.setToolTip(_cb_tip)
+        self._bail_ascend_now_cb.stateChanged.connect(self._on_input_change)
+        _bail_g.addWidget(_cb_lbl,                  _CB_INSERT, 0, Qt.AlignmentFlag.AlignLeft)
+        _bail_g.addWidget(self._bail_ascend_now_cb, _CB_INSERT, 1, Qt.AlignmentFlag.AlignRight)
+
+        _bail_grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        gen_hl.addWidget(_bail_grp, stretch=1)
 
         tabs.addTab(gen_w, "General")
 
@@ -790,6 +841,7 @@ class DivePlannerTab(QWidget):
         for _, attr, default in self._SETTINGS_FIELDS:
             le = getattr(self, attr + "_le", None)
             gs[attr] = le.text() if le else default
+        gs["_bail_ascend_now"] = "1" if self._bail_ascend_now_cb.isChecked() else "0"
         self._db["global_settings"] = gs
         from main_qt import save_db
         save_db(self._db)
@@ -803,6 +855,7 @@ class DivePlannerTab(QWidget):
             le = getattr(self, attr + "_le", None)
             if le:
                 le.setText(gs.get(attr, default))
+        self._bail_ascend_now_cb.setChecked(gs.get("_bail_ascend_now", "0") == "1")
 
     # ── Gas Correction tab helpers ────────────────────────────────────────────
 
@@ -2472,26 +2525,17 @@ class DivePlannerTab(QWidget):
         t_ccr, d_ccr = _profile_from_tl(ccr_tl)
         t_bail, d_bail = _profile_from_tl(bail_tl)
 
-        # Shift bailout profile: remove bail_extra phase, OC ascent starts at CCR ascent time
-        _bail_extra_chart = getattr(self, '_bail_extra_chart', 0.0)
+        _bail_extra_chart    = getattr(self, '_bail_extra_chart', 0.0)
+        _bail_ascend_now_chart = getattr(self, '_bail_ascend_now_chart', False)
         _bail_mark_t0 = _bail_mark_t1 = _bail_mark_d = None
         if t_bail and _bail_extra_chart > 0:
             _ccr_end = sum(t for _, t in (segments or []))
-            _bail_end = _ccr_end + _bail_extra_chart
-            t_bail_new, d_bail_new, _anchor_added = [], [], False
-            for t, d in zip(t_bail, d_bail):
-                if t <= _ccr_end:
-                    t_bail_new.append(t); d_bail_new.append(d)
-                elif t > _bail_end:
-                    if not _anchor_added:
-                        t_bail_new.append(_ccr_end); d_bail_new.append(d)
-                        _anchor_added = True
-                    t_bail_new.append(t - _bail_extra_chart); d_bail_new.append(d)
-            t_bail, d_bail = t_bail_new, d_bail_new
-            # Mark the OC bail period at the bottom
             _bail_mark_d  = max(d_ccr) if d_ccr else 0.0
             _bail_mark_t0 = _ccr_end - _bail_extra_chart
-            _bail_mark_t1 = _ccr_end
+            if not _bail_ascend_now_chart:
+                _bail_mark_t1 = _ccr_end   # scenario 1: flat at bottom until CCR ascent time
+            else:
+                _bail_mark_t1 = _bail_mark_t0  # scenario 2: just a point marker, no flat period
 
         if not t_ccr and not segments:
             ax.text(0.5, 0.5, "No dive data", ha="center", va="center",
@@ -2528,14 +2572,16 @@ class DivePlannerTab(QWidget):
             ax.plot(t_bail, d_bail, color="#e07a20", linewidth=1.4,
                     linestyle="--", alpha=0.85, label="Bailout OC")
 
-        # OC bail period marker at bottom depth
+        # OC bail period marker
         if _bail_mark_t0 is not None and _bail_mark_d:
-            ax.hlines(_bail_mark_d, _bail_mark_t0, _bail_mark_t1,
-                      colors="#e07a20", linewidth=6, alpha=0.55, zorder=4)
-            ax.text(_bail_mark_t1, _bail_mark_d,
-                    f"  +{_bail_extra_chart:.0f} min OC",
-                    ha="left", va="center", fontsize=6.5, color="#b05010",
-                    fontweight="bold")
+            if not _bail_ascend_now_chart:
+                # Scenario 1: horizontal bar showing OC time at depth
+                ax.hlines(_bail_mark_d, _bail_mark_t0, _bail_mark_t1,
+                          colors="#e07a20", linewidth=6, alpha=0.55, zorder=4)
+                ax.text(_bail_mark_t1, _bail_mark_d,
+                        f"  +{_bail_extra_chart:.0f} min OC",
+                        ha="left", va="center", fontsize=6.5, color="#b05010",
+                        fontweight="bold")
 
         # Deco stop markers from saved stops
         for s in self._saved_stops:
@@ -3054,6 +3100,7 @@ class DivePlannerTab(QWidget):
         _stop_iv   = max(1.0, self._get_setting("_stop_int",    3.0))
         _last_stop = max(0.0, self._get_setting("_last_stop",   3.0))
         _bail_extra = max(0.0, self._get_setting("_bail_deco_time", 0.0))
+        _bail_ascend_now = self._bail_ascend_now_cb.isChecked()
 
         sim_params = {
             "segments":       segments,
@@ -3072,6 +3119,7 @@ class DivePlannerTab(QWidget):
             "stop_iv":        _stop_iv,
             "last_stop":      _last_stop,
             "bail_extra":     _bail_extra,
+            "bail_ascend_now": _bail_ascend_now,
         }
 
         # Cancel any still-running calculation before starting the new one
@@ -3102,8 +3150,10 @@ class DivePlannerTab(QWidget):
         deco_r        = p["deco_r"]
         _snap_iv      = p["snap_iv"]
         _stop_iv      = p["stop_iv"]
-        _last_stop    = p["last_stop"]
-        T_c           = TEMP_C_DEFAULT
+        _last_stop       = p["last_stop"]
+        _bail_extra      = p["bail_extra"]
+        _bail_ascend_now = p.get("bail_ascend_now", False)
+        T_c              = TEMP_C_DEFAULT
 
         # ── CCR simulation results ────────────────────────────────────────────
         result = r.get("result")
@@ -3363,11 +3413,20 @@ class DivePlannerTab(QWidget):
                     cur_d = seg_depth
                 t_at = max(0.0, total_seg_time - t_travel)
                 if t_at > 0:
-                    cur_rt += t_at
-                    _consume_ccr(t_at, seg_depth, seg_depth)
-                    if seg_depth >= _max_plan_depth:
-                        _rp_at_bailout = dict(_rp)   # capture after bottom time at max depth
-                        ccr_bottom_rt = cur_rt       # CCR runtime at end of bottom stop
+                    if seg_depth >= _max_plan_depth and _bail_extra > 0:
+                        t_ccr = max(0.0, t_at - _bail_extra)
+                        _consume_ccr(t_ccr, seg_depth, seg_depth)
+                        cur_rt += t_ccr
+                        _rp_at_bailout = dict(_rp)   # snapshot at bailout point
+                        _consume_ccr(_bail_extra, seg_depth, seg_depth)
+                        cur_rt += _bail_extra
+                        ccr_bottom_rt = cur_rt
+                    else:
+                        cur_rt += t_at
+                        _consume_ccr(t_at, seg_depth, seg_depth)
+                        if seg_depth >= _max_plan_depth:
+                            _rp_at_bailout = dict(_rp)
+                            ccr_bottom_rt = cur_rt
                     ccr_display.append({"_label": f"{seg_depth:.0f}m", "depth": seg_depth,
                                         "time": t_at, "runtime": cur_rt, "gas": dil_mix,
                                         "_show_time": True})
@@ -3428,16 +3487,19 @@ class DivePlannerTab(QWidget):
         # ── Bailout simulation results ────────────────────────────────────────
         bail_stops = []
         bail_total_runtime = None
-        _bail_extra   = p["bail_extra"]
         bail_segments = segments
-        self._bail_extra_chart = _bail_extra
+        self._bail_extra_chart    = _bail_extra
+        self._bail_ascend_now_chart = _bail_ascend_now
         if oc_gases:
             bail = r.get("bail")
             if bail is not None:
-                _sim_bottom_exit = sum(t for _, t in bail_segments) + _bail_extra
+                # bail_segs had last max-depth seg reduced by bail_extra, so:
+                # sum(bail_segs) + bail_extra = sum(original_segs) = _sim_bottom_exit
+                _sim_bottom_exit = sum(t for _, t in bail_segments)
                 _bail_rt_offset  = ccr_bottom_rt - _sim_bottom_exit
+                _bail_at_rt      = ccr_bottom_rt - _bail_extra
                 self._bail_summary_lbl.setText(
-                    f"Bailout at: {ccr_bottom_rt:.0f} min  |  "
+                    f"Bailout at: {_bail_at_rt:.0f} min  |  "
                     f"TTS: {bail.tts:.0f} min  |  "
                     f"Runtime: {bail.runtime + _bail_rt_offset:.0f} min  |  "
                     f"OTU: {bail.otu:.0f}  |  CNS: {bail.cns:.1f} %"
@@ -3584,23 +3646,29 @@ class DivePlannerTab(QWidget):
             _snap_o2i    = snap_te.get("o2i", 0) if snap_te else 0
             _snap_po2    = (max_depth_seg / 10.0 + 1.0) * (_snap_o2i / 100.0)
 
-            # Consume extra OC gas for _bail_extra minutes at depth
+            # Buoyancy at the CCR bailout switch point (before any OC gas is spent)
+            snap_buoy = _total(plan_base)
+
+            # Scenario 1 only: consume OC gas for bail_extra minutes at depth
             _snap_used_bar = 0
-            if _bail_extra > 0 and snap_te:
+            if _bail_extra > 0 and not _bail_ascend_now and snap_te:
                 _extra_L = sac * _bail_extra * (max_depth_seg / 10.0 + 1.0)
                 _consume(plan_drop, snap_te, _extra_L)
                 _consume(plan_base, snap_te, _extra_L)
                 _snap_pres_after = _get_pres(plan_base, snap_te)
                 _snap_used_bar = max(0, round((snap_pres or 0) - (_snap_pres_after or 0)))
 
-            snap_buoy = _total(plan_base)
-
-            _bail_extra_lbl = (f"@ {max_depth_seg:.0f}m  +{_bail_extra:.0f} min"
-                               if _bail_extra > 0 else f"@ {max_depth_seg:.0f}m")
+            if _bail_ascend_now and _bail_extra > 0:
+                _bail_extra_lbl = f"@ {max_depth_seg:.0f}m  ↑ now"
+            elif _bail_extra > 0:
+                _bail_extra_lbl = f"@ {max_depth_seg:.0f}m  +{_bail_extra:.0f} min"
+            else:
+                _bail_extra_lbl = f"@ {max_depth_seg:.0f}m"
+            _snap_time = 0 if (_bail_ascend_now or _bail_extra == 0) else _bail_extra
             bail_display.append({"_label": _bail_extra_lbl,
                                   "depth": max_depth_seg,
-                                  "time": _bail_extra if _bail_extra > 0 else 0,
-                                  "runtime": ccr_bottom_rt,
+                                  "time": _snap_time,
+                                  "runtime": ccr_bottom_rt - _bail_extra,
                                   "gas": snap_gas_lbl})
             bail_extra.append([(f"{_snap_po2:.2f}", 65, "e"),
                                 (f"{snap_pres:.0f}" if snap_pres is not None else "—", 75, "e"),
@@ -3617,7 +3685,8 @@ class DivePlannerTab(QWidget):
                 first_stop_d = bail_real_first
                 waypoints = _oc_ascent_waypoints(max_depth_seg, first_stop_d, oc_gases)
                 total_transit_time = (max_depth_seg - first_stop_d) / asc_r
-                seg_runtime_offset = ccr_bottom_rt
+                # Scenario 2: ascent starts at bailout point, not at CCR ascent time
+                seg_runtime_offset = (ccr_bottom_rt - _bail_extra) if _bail_ascend_now else ccr_bottom_rt
                 seg_top = max_depth_seg
                 transit_gas_label = (select_oc_gas(max_depth_seg, oc_gases).label()
                                      if oc_gases else None)

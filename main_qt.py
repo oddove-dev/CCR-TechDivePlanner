@@ -1021,13 +1021,35 @@ class _CylCard(QGroupBox):
     """Cylinder / stage slot card with live calculated results."""
 
     RESULT_ROWS = [
-        ("Buoyancy SW ref [kg]", "ref_buoy_sw", False),
-        ("Volume bottle [L]",    "vol_bottle",  False),
-        ("Gas mass [kg]",        "gas_mass",    False),
-        ("Buoyancy SW [kg]",     "buoyancy_sw", True ),
-        ("Z factor",             "Z",           False),
-        ("Real gas [L]",         "real_gas",    False),
-        ("Ideal gas [L]",        "ideal_gas",   False),
+        ("Buoyancy SW ref [kg]", "ref_buoy_sw", False,
+         "Buoyancy of the empty cylinder in salt water at rated fill.\n"
+         "Formula: volume × ρSW − (dry_mass − gas_mass_rated)\n"
+         "This is the fixed reference — does not change with actual fill pressure."),
+        ("Volume bottle [L]",    "vol_bottle",  False,
+         "Internal volume of the cylinder, derived from dry/wet mass difference.\n"
+         "Formula: (dry − wet) / ρFW"),
+        ("Gas mass [kg]",        "gas_mass",    False,
+         "Mass of gas in the cylinder at the actual fill pressure.\n"
+         "Calculated using the real gas law with Z-factor correction.\n"
+         "Higher pressure or denser mix (He) = heavier gas."),
+        ("Buoyancy SW [kg]",     "buoyancy_sw", True,
+         "Net buoyancy of the cylinder including its current gas load, in salt water.\n"
+         "Negative = sinks, Positive = floats.\n"
+         "Formula: ref_empty_buoyancy − gas_mass_actual\n"
+         "This value changes as gas is consumed during the dive."),
+        ("Z factor",             "Z",           False,
+         "Real gas compressibility factor at current pressure and temperature.\n"
+         "Corrects the ideal gas law (PV=nRT) for high-pressure behaviour.\n"
+         "Z < 1: gas is more compressible than ideal (common at moderate pressure).\n"
+         "Z > 1: gas is less compressible than ideal (common at very high pressure)."),
+        ("Real gas [L]",         "real_gas",    False,
+         "Actual gas volume at surface pressure, corrected for Z-factor.\n"
+         "Formula: V_bottle × P_abs / Z\n"
+         "More accurate than ideal gas, especially above 200 bar."),
+        ("Ideal gas [L]",        "ideal_gas",   False,
+         "Gas volume assuming ideal gas behaviour (PV = nRT, Z = 1).\n"
+         "Formula: V_bottle × P_gauge\n"
+         "Overestimates actual gas by ~5–10 % at high pressures."),
     ]
 
     def __init__(self, title: str, db: dict, on_change):
@@ -1047,29 +1069,41 @@ class _CylCard(QGroupBox):
         self._cyl_cb.currentTextChanged.connect(self._on_cyl_changed)
         lay.addWidget(self._cyl_cb, r, 0, 1, 2); r += 1
 
-        lay.addWidget(QLabel("Gas (O₂/He):"), r, 0)
+        _gas_lbl = QLabel("Gas (O₂/He):")
+        _gas_lbl.setToolTip("Enter gas mix as O₂% / He%.\nExamples: 21/0 = Air, 32/0 = Nitrox 32, 21/35 = Trimix 21/35, 99/0 = O₂.")
+        lay.addWidget(_gas_lbl, r, 0)
         self._gas_le = QLineEdit("21/0")
         self._gas_le.setFixedWidth(70)
         self._gas_le.setStyleSheet("background:#ffe0e0;")
+        self._gas_le.setToolTip("Enter gas mix as O₂% / He%.\nExamples: 21/0 = Air, 32/0 = Nitrox 32, 21/35 = Trimix 21/35, 99/0 = O₂.")
         self._gas_le.textChanged.connect(self._on_gas_text)
         lay.addWidget(self._gas_le, r, 1); r += 1
 
-        lay.addWidget(QLabel("Pressure [bar]:"), r, 0)
+        _pres_lbl = QLabel("Pressure [bar]:")
+        _pres_lbl.setToolTip("Actual fill pressure of the cylinder in bar (gauge).\nThis is the pressure shown on the cylinder gauge before the dive.")
+        lay.addWidget(_pres_lbl, r, 0)
         self._pres_le = QLineEdit("")
         self._pres_le.setFixedWidth(70)
         self._pres_le.setStyleSheet("background:#ffe0e0;")
+        self._pres_le.setToolTip("Actual fill pressure of the cylinder in bar (gauge).\nThis is the pressure shown on the cylinder gauge before the dive.")
         self._pres_le.textChanged.connect(self._recalc)
         lay.addWidget(self._pres_le, r, 1); r += 1
 
         lay.addWidget(_hline(), r, 0, 1, 2); r += 1
 
-        for lbl_txt, key, bold in self.RESULT_ROWS:
+        for row in self.RESULT_ROWS:
+            lbl_txt, key, bold = row[0], row[1], row[2]
+            tip = row[3] if len(row) > 3 else ""
             lbl = QLabel(lbl_txt + ":")
             if bold:
                 lbl.setStyleSheet("font-weight:bold;")
+            if tip:
+                lbl.setToolTip(tip)
             lay.addWidget(lbl, r, 0)
             val = QLabel("---")
             val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            if tip:
+                val.setToolTip(tip)
             val.setFrameShape(QFrame.Shape.StyledPanel)
             val.setFixedWidth(70)
             bg = "#dff0df" if bold else "#f0f0f0"
@@ -1586,6 +1620,9 @@ class BuoyancyPlannerTab(QWidget):
 
         # DIVER BUOYANCY
         dbox, dl = _section_groupbox("DIVER BUOYANCY")
+        dbox.setToolTip("Row 1: diver buoyancy due to clothing only — the buoyancy contribution\n"
+                        "of the diver's suit (wetsuit/drysuit/undersuit), not including lead.\n"
+                        "Rows 2–3: additional diver buoyancy items (e.g. weight belt, lead canister).")
         dl.setSpacing(2)
         row0 = _EquipRow(db, _diver_names(db),
                          eslots[0] if len(eslots) > 0 else {}, self._recalc_summary,
@@ -1603,6 +1640,9 @@ class BuoyancyPlannerTab(QWidget):
 
         # JJ CORE BUOYANCY
         cbox, cl = _section_groupbox("CORE BUOYANCY")
+        cbox.setToolTip("Fixed structural components of the CCR unit.\n"
+                        "Typically the backplate, wing, harness, scrubber and head assembly.\n"
+                        "These items are always present — not interchangeable between dives.")
         cl.setSpacing(2)
         core = _equip_names(db, "jj_core")
         base = 1 + self.N_DIVER_EQ
@@ -1616,6 +1656,9 @@ class BuoyancyPlannerTab(QWidget):
 
         # JJ MODULAR BUOYANCY
         mbox, ml = _section_groupbox("MODULAR BUOYANCY")
+        mbox.setToolTip("Interchangeable items attached to the CCR for a specific dive.\n"
+                        "Typically trim weights, lead bars, or additional lift cells.\n"
+                        "These are selected per dive to achieve the target buoyancy.")
         ml.setSpacing(2)
         mod = _equip_names(db, "jj_modular")
         base2 = base + self.N_CORE
@@ -1633,26 +1676,59 @@ class BuoyancyPlannerTab(QWidget):
         sl.setSpacing(3)
         sv.addLayout(sl)
         SROWS = [
-            ("jj_with_bottles",  "CCR with bottles"),
-            ("jj_diving_ready",  "CCR diving ready"),
-            ("diver",            "Diver"),
-            ("jj_diver",         "CCR + Diver"),
-            ("jj_diver_stages",  "CCR + Diver + Stages"),
-            ("stage1",           "Stage 1"),
-            ("stage2",           "Stage 2"),
-            ("stage3",           "Stage 3"),
+            ("jj_with_bottles",  "CCR with bottles",
+             "Core buoyancy + all JJ cylinders (diluent, O₂, inflation).\n"
+             "Total buoyancy of the CCR unit as it comes out of the water,\n"
+             "before adding diver or stage cylinders."),
+            ("jj_diving_ready",  "CCR diving ready",
+             "Core + modular buoyancy + all JJ cylinders.\n"
+             "Full CCR system buoyancy including modular items (lead bars etc.)\n"
+             "but without the diver or stage cylinders."),
+            ("diver",            "Diver",
+             "Diver buoyancy: lead weight contribution + clothing (wetsuit/drysuit).\n"
+             "Lead contribution = lead_volume × ρSW − lead_mass (negative = sinks).\n"
+             "Clothing contribution = displaced_volume × ρSW − dry_mass."),
+            ("jj_diver",         "CCR + Diver",
+             "CCR diving ready + Diver.\n"
+             "Total system buoyancy at the start of the dive, without stage cylinders.\n"
+             "Target: approximately −1 kg prior to the dive."),
+            ("jj_diver_stages",  "CCR + Diver + Stages",
+             "Complete system buoyancy including all stage/bailout cylinders at full fill.\n"
+             "This is the baseline value used in the Dive Planner.\n"
+             "\n"
+             "Target range: −2 to −4 kg, depending on the bailout strategy:\n"
+             "  • −2 kg: normal dive, empty stage given to buddy or dropped.\n"
+             "  • −3 to −4 kg: plan to surface with all cylinders (no drops),\n"
+             "    consuming all bailout and interstage gas during ascent.\n"
+             "\n"
+             "The required starting buoyancy depends on gas volumes consumed\n"
+             "and whether cylinders are dropped during the dive.\n"
+             "Use the Dive Planner to determine the correct weight strategy."),
+            ("stage1",           "Stage 1",
+             "Buoyancy of Stage 1 cylinder at current fill pressure.\n"
+             "Negative = sinks, Positive = floats."),
+            ("stage2",           "Stage 2",
+             "Buoyancy of Stage 2 cylinder at current fill pressure."),
+            ("stage3",           "Stage 3",
+             "Buoyancy of Stage 3 cylinder at current fill pressure."),
         ]
         self._sum_lbls = {}
         self._sum_dry_lbls = {}
-        for sr, (key, lbl_txt) in enumerate(SROWS):
+        for sr, row_def in enumerate(SROWS):
+            key, lbl_txt = row_def[0], row_def[1]
+            tip = row_def[2] if len(row_def) > 2 else ""
             row_lbl = QLabel(lbl_txt + ":")
             row_lbl.setFixedWidth(_COL_CB)
+            if tip:
+                row_lbl.setToolTip(tip)
             sl.addWidget(row_lbl, sr, 0)
             dry_v = QLabel("---")
             dry_v.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             dry_v.setFrameShape(QFrame.Shape.StyledPanel)
             dry_v.setStyleSheet("background:#f0f0f0; padding:1px 3px;")
             dry_v.setFixedWidth(_COL_DRY)
+            if tip:
+                dry_v.setToolTip(tip)
             sl.addWidget(dry_v, sr, 1)
             self._sum_dry_lbls[key] = dry_v
             v = QLabel("---")
@@ -1660,6 +1736,8 @@ class BuoyancyPlannerTab(QWidget):
             v.setFrameShape(QFrame.Shape.StyledPanel)
             v.setStyleSheet("background:#dff0df; padding:1px 3px;")
             v.setFixedWidth(_COL_BUOY)
+            if tip:
+                v.setToolTip(tip)
             sl.addWidget(v, sr, 2)
             self._sum_lbls[key] = v
         ll.addWidget(sbox)
