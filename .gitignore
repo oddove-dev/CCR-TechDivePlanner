@@ -1,21 +1,23 @@
-# Python
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Personal user databases
+*.db
+
+# Example / scratch files
+danger_example.py
+danger_example.png
+
+# Shearwater reader (standalone utility, not part of the planner)
+shearwater_reader.py
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
-
-# Claude
-.claude/
-
-# Virtual environments
-.venv/
-venv/
-env/
-
-# IDE
-.vscode/
-.idea/
 
 # OS
-Thumbs.db
 .DS_Store
+Thumbs.db
