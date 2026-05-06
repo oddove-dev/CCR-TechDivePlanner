@@ -116,6 +116,19 @@ def migrate_baseline_buoyancy_flag(db: dict) -> None:
     save_db(db)
 
 
+def _migrate_diver_users(db):
+    """One-time: tag existing divers with a user field based on name prefix."""
+    if db.get("_diver_user_migrated"):
+        return
+    users = list(db.get("users", {}).keys())
+    for diver in db.get("divers", []):
+        if "user" not in diver:
+            matched = next((u for u in users if diver.get("name","").startswith(u)), None)
+            diver["user"] = matched if matched else "All"
+    db["_diver_user_migrated"] = True
+    save_db(db)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper widgets
 # ─────────────────────────────────────────────────────────────────────────────
@@ -649,18 +662,28 @@ class DiverDialog(QDialog):
         self._cb_baseline.setToolTip(self._BASELINE_TOOLTIP)
         left_lay.addWidget(self._cb_baseline, r_cb + 1, 0, 1, 2)
 
+        # User assignment
+        user_names = ["All"] + list((self._db or {}).get("users", {}).keys())
+        left_lay.addWidget(QLabel("User:"), r_cb + 2, 0)
+        self._user_cb = QComboBox()
+        self._user_cb.addItems(user_names)
+        saved_user = self._data.get("user", "All") or "All"
+        if saved_user in user_names:
+            self._user_cb.setCurrentText(saved_user)
+        left_lay.addWidget(self._user_cb, r_cb + 2, 1)
+
         # Clothing dropdowns
         equip_names = ["(none)"] + [e["name"] for e in (self._db or {}).get("equipment", [])]
         self._clothing_cbs: list[QComboBox] = []
         for i, slot_key in enumerate(("clothing_slot_1", "clothing_slot_2")):
-            left_lay.addWidget(QLabel(f"Clothing {i + 1}:"), r_cb + 2 + i, 0)
+            left_lay.addWidget(QLabel(f"Clothing {i + 1}:"), r_cb + 3 + i, 0)
             cb = QComboBox()
             cb.addItems(equip_names)
             saved = self._data.get(slot_key, "")
             if saved and saved in equip_names:
                 cb.setCurrentText(saved)
             cb.currentIndexChanged.connect(self._recalc)
-            left_lay.addWidget(cb, r_cb + 2 + i, 1)
+            left_lay.addWidget(cb, r_cb + 3 + i, 1)
             self._clothing_cbs.append(cb)
 
         # Buttons
@@ -673,7 +696,7 @@ class DiverDialog(QDialog):
         cancel_btn.clicked.connect(self.reject)
         btn_lay.addWidget(ok_btn)
         btn_lay.addWidget(cancel_btn)
-        left_lay.addLayout(btn_lay, r_cb + 4, 0, 1, 2)
+        left_lay.addLayout(btn_lay, r_cb + 5, 0, 1, 2)
 
         # ── Right: calculated preview ─────────────────────────────────────────
         right_box = QGroupBox("Calculated preview")
@@ -758,6 +781,7 @@ class DiverDialog(QDialog):
                     return
         self._data["category"]          = "Diver Buoyancy" if self._cb_diver.isChecked() else ""
         self._data["baseline_buoyancy"] = self._cb_baseline.isChecked()
+        self._data["user"]              = self._user_cb.currentText()
         slot_keys = ("clothing_slot_1", "clothing_slot_2")
         for cb, slot_key in zip(self._clothing_cbs, slot_keys):
             name = cb.currentText()
@@ -947,18 +971,20 @@ class EquipmentTable(_SectionTable):
 
 class DiverTable(_SectionTable):
     COLUMNS = [
-        ("Name",              200),
-        ("Category",          140),
-        ("Lead dry [kg]",     110),
-        ("Diver dry [kg]",    110),
-        ("Baseline",           65),
+        ("Name",              180),
+        ("User",               90),
+        ("Category",          120),
+        ("Lead dry [kg]",     100),
+        ("Diver dry [kg]",    100),
+        ("Baseline",           60),
     ]
     TOOLBAR_COLOR = CLR_TOOLBAR_DV
     ADD_LABEL = "+ Add Diver"
 
     def _to_row(self, it):
-        return [it.get("name",""), it.get("category",""),
-                it.get("lead_dry_mass",""), it.get("diver_dry_mass",""),
+        return [it.get("name",""), it.get("user","All") or "All",
+                it.get("category",""), it.get("lead_dry_mass",""),
+                it.get("diver_dry_mass",""),
                 "✓" if it.get("baseline_buoyancy") else ""]
 
     def _open_dialog(self, data):
@@ -1010,8 +1036,12 @@ class DatabasesTab(QWidget):
 def _cyl_names(db) -> list:
     return ["—"] + [c["name"] for c in db.get("cylinders", [])]
 
-def _diver_names(db) -> list:
-    return ["—"] + [d["name"] for d in db.get("divers", [])]
+def _diver_names(db, user=None) -> list:
+    divers = db.get("divers", [])
+    if user:
+        divers = [d for d in divers
+                  if d.get("user") in (user, None, "", "All")]
+    return ["—"] + [d["name"] for d in divers]
 
 def _equip_names(db, flag) -> list:
     return ["—"] + [e["name"] for e in db.get("equipment", []) if e.get(flag)]
@@ -1624,9 +1654,9 @@ class BuoyancyPlannerTab(QWidget):
                         "of the diver's suit (wetsuit/drysuit/undersuit), not including lead.\n"
                         "Rows 2–3: additional diver buoyancy items (e.g. weight belt, lead canister).")
         dl.setSpacing(2)
-        row0 = _EquipRow(db, _diver_names(db),
+        row0 = _EquipRow(db, _diver_names(db, self._current_user()),
                          eslots[0] if len(eslots) > 0 else {}, self._recalc_summary,
-                         choices_fn=lambda: _diver_names(db))
+                         choices_fn=lambda: _diver_names(db, self._current_user()))
         self._e_rows.append(row0)
         dl.addWidget(row0)
         dequ = _equip_names(db, "diver_buoyancy")
@@ -1948,6 +1978,7 @@ class MainWindow(QMainWindow):
 
         self._db = load_db()
         migrate_baseline_buoyancy_flag(self._db)
+        _migrate_diver_users(self._db)
 
         self._tabs = QTabWidget()
         self._tabs.setDocumentMode(True)
@@ -1976,9 +2007,9 @@ class MainWindow(QMainWindow):
                      .get("deco_profiles", {}))
         dp_tab.load_deco_profiles(profiles0)
 
-        # ── Gas Calculator ────────────────────────────────────────────────────
+        # ── Gas Planner ───────────────────────────────────────────────────────
         gc_tab = GasCalcTabQt(db=self._db, save_fn=lambda: save_db(self._db))
-        self._tabs.addTab(gc_tab, "  Gas Calculator  ")
+        self._tabs.addTab(gc_tab, "  Gas Planner  ")
 
         # ── Databases tab ─────────────────────────────────────────────────────
         scroll = QScrollArea()

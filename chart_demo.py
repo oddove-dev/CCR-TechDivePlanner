@@ -119,7 +119,7 @@ for ax in [AX_PROFILE, AX_PO2, AX_TISSUE, AX_GAS]:
 # ── Chart 1: Dive Profile ─────────────────────────────────────────────────────
 
 ax = AX_PROFILE
-ax.set_title("1 — Dykkeprofil  (CCR vs Bailout)", color=TEXT_COLOR, fontsize=10, pad=6)
+ax.set_title("1 — CCR vs Bailout", color=TEXT_COLOR, fontsize=10, pad=6)
 
 t_c = [p[0] for p in PROFILE_CCR]
 d_c = [p[1] for p in PROFILE_CCR]

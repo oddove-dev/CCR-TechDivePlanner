@@ -14,10 +14,10 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel, QPushButton,
     QLineEdit, QScrollArea, QFrame, QGroupBox, QSizePolicy, QSplitter,
     QListWidget, QAbstractItemView, QCheckBox, QComboBox, QSpacerItem, QTabWidget,
-    QMessageBox,
+    QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QColor
 
 from cylindercalc import z_mix, calc_gas_mass, RHO_SW, RHO_FW, RHO_PB
 from buhlmann import (
@@ -291,7 +291,7 @@ class _SimWorker(QThread):
                 asc_rate      = p["asc_r"],
                 deco_rate     = p["deco_r"],
                 snap_interval = p["snap_iv"],
-                stop_interval = p["stop_iv"],
+                stop_interval = p["ccr_stop_iv"],
                 last_stop     = p["last_stop"],
             )
         except Exception as e:
@@ -330,6 +330,7 @@ class _SimWorker(QThread):
                     snap_interval = p["snap_iv"],
                     stop_interval = p["stop_iv"],
                     bail_extra    = _sim_bail_extra,
+                    last_stop     = p["bo_last_stop"],
                 )
             except Exception as e:
                 out["bail"]       = None
@@ -613,29 +614,28 @@ class DivePlannerTab(QWidget):
         ("Descend SP [bar]",   "_sp_desc",     "0.7"),
         ("Bottom SP [bar]",    "_sp",          "1.3"),
         ("Deco SP [bar]",      "_sp_deco",     "1.6"),
-        ("Last stop [m]",      "_last_stop",   "3"),
-        ("GF Low [%]",         "_gf_lo",       "30"),
-        ("GF High [%]",        "_gf_hi",       "80"),
+        ("Last stop [m]",      "_last_stop",      "3"),
+        ("Stop interval [m]",  "_ccr_stop_int",   "3"),
+        ("Display int [m]",    "_ccr_display_int","3"),
+        ("GFL/GFH [%]",        "_gf",             "30/80"),
         ("Descent [m/min]",    "_desc_r",      "20"),
         ("Ascent [m/min]",     "_asc_r",       "9"),
         ("Deco rate [m/min]",  "_deco_r",      "3"),
         ("SAC [L/min]",        "_sac",         "20"),
-        ("BO deco sw SP [bar]","_deko_sw",     "1.6"),
+        ("Bailout max PO2 [bar]","_deko_sw",     "1.6"),
         ("Stop interval [m]",  "_stop_int",    "3"),
         ("Display int [m]",    "_display_int", "3"),
-        ("Loop vol [L]",       "_ccr_loop_vol","7"),
-        ("Metab O2 [L/min]",   "_ccr_o2_rate", "0.3"),
         ("Bailout time before CCR ascent", "_bail_deco_time", "0"),
-        ("BO GF Low [%]",      "_bo_gf_lo",    "30"),
-        ("BO GF High [%]",     "_bo_gf_hi",    "80"),
+        ("Last stop [m]",      "_bo_last_stop", "3"),
+        ("GFL/GFH [%]",     "_bo_gf",       "30/80"),
     ]
     # Gas Correction tab — correction factors and one-time events
     _GAS_CORR_FIELDS = [
         ("Diluent correction [%]",  "_dil_correction",  "50"),
         ("O2 correction [%]",       "_o2_correction",   "50"),
         ("Inflation correction [%]","_infl_correction", "50"),
-        ("Mask clear vol [L]",      "_mask_clear_vol",  "0.5"),
-        ("Deco loop refill [L]",    "_deco_refill_vol", "7.0"),
+        ("Loop vol [L]",            "_ccr_loop_vol",    "7"),
+        ("Metab O2 [L/min]",        "_ccr_o2_rate",     "0.3"),
     ]
     # Gas Correction tab — drysuit/BCD sizing
     _BUOYANCY_FIELDS = [
@@ -697,6 +697,26 @@ class DivePlannerTab(QWidget):
                 g.addWidget(le,  r, 1, Qt.AlignmentFlag.AlignRight)
             return grp
 
+        _gen_grp = _make_grp("General", [
+            ("Descent [m/min]",   "_desc_r",   "20",
+             "Rate of descent from surface to target depth.\n"
+             "Typical: 20 m/min."),
+            ("Ascent [m/min]",    "_asc_r",    "9",
+             "Rate of ascent from bottom to the first decompression stop.\n"
+             "Typical: 9–10 m/min (PADI/DSAT standard)."),
+            ("Deco rate [m/min]", "_deco_r",   "3",
+             "Rate of ascent between decompression stops.\n"
+             "Slower than the main ascent rate to allow controlled off-gassing.\n"
+             "Typical: 3–10 m/min."),
+        ])
+        _cmp_open_btn = QPushButton("Compare profiles…")
+        _cmp_open_btn.setStyleSheet(
+            "background:#2255aa; color:white; font-weight:bold; "
+            "padding:4px 6px; font-size:10px;")
+        _cmp_open_btn.clicked.connect(self._open_compare_window)
+        _gen_grp.layout().addWidget(_cmp_open_btn, 3, 0, 1, 2)
+        _gen_grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
         for grp in [
             _make_grp("CCR", [
                 ("Descend SP [bar]",  "_sp_desc",      "0.7",
@@ -714,38 +734,17 @@ class DivePlannerTab(QWidget):
                 ("Last stop [m]",     "_last_stop",    "3",
                  "Depth of the shallowest decompression stop before surfacing.\n"
                  "Typical: 3–6 m. Shallower = more conservative."),
-                ("Loop vol [L]",      "_ccr_loop_vol", "7",
-                 "Volume of the CCR breathing loop (mouthpiece + hoses + scrubber).\n"
-                 "Used to calculate diluent consumed when flushing the loop at depth.\n"
-                 "Typical JJ-CCR: 7 L."),
-                ("Metab O2 [L/min]",  "_ccr_o2_rate",  "0.3",
-                 "Oxygen metabolic consumption rate at rest / light work.\n"
-                 "Used to estimate O₂ cylinder usage during the dive.\n"
-                 "Typical resting value: 0.3 L/min."),
-                ("GF Low [%]",        "_gf_lo",        "30",
-                 "Gradient Factor Low — controls the depth of the first deco stop.\n"
-                 "Lower value = deeper first stop = more conservative.\n"
-                 "Buhlmann ZHL-16C parameter. Typical: 30–50 %."),
-                ("GF High [%]",       "_gf_hi",        "80",
-                 "Gradient Factor High — controls allowed supersaturation at the surface.\n"
-                 "Lower value = more conservative surface ceiling.\n"
-                 "Buhlmann ZHL-16C parameter. Typical: 70–85 %."),
-            ]),
-            _make_grp("General", [
-                ("Descent [m/min]",   "_desc_r",   "20",
-                 "Rate of descent from surface to target depth.\n"
-                 "Typical: 20 m/min."),
-                ("Ascent [m/min]",    "_asc_r",    "9",
-                 "Rate of ascent from bottom to the first decompression stop.\n"
-                 "Typical: 9–10 m/min (PADI/DSAT standard)."),
-                ("Deco rate [m/min]", "_deco_r",   "3",
-                 "Rate of ascent between decompression stops.\n"
-                 "Slower than the main ascent rate to allow controlled off-gassing.\n"
-                 "Typical: 3–10 m/min."),
-                ("SAC [L/min]",       "_sac",      "20",
-                 "Surface Air Consumption — breathing rate normalised to 1 bar.\n"
-                 "Actual consumption at depth = SAC × (depth/10 + 1).\n"
-                 "Used to calculate OC bailout gas usage. Typical: 15–25 L/min."),
+                ("Stop interval [m]", "_ccr_stop_int", "3",
+                 "Depth interval between computed CCR decompression stops.\n"
+                 "1 m = fine resolution, 3 m = standard."),
+                ("Display int [m]",   "_ccr_display_int", "3",
+                 "Controls which CCR stop depths are shown in the table.\n"
+                 "Set to 1 to see every metre, 3 to see every 3 m."),
+                ("GFL/GFH [%]",       "_gf",           "30/80",
+                 "Gradient Factors as GF Low / GF High, e.g. 30/80.\n"
+                 "GF Low controls first stop depth (lower = deeper = more conservative).\n"
+                 "GF High controls surface ceiling (lower = more conservative).\n"
+                 "Bühlmann ZHL-16C parameter. Typical: 30/80."),
             ]),
         ]:
             grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -760,9 +759,21 @@ class DivePlannerTab(QWidget):
         _bail_g.setVerticalSpacing(3)
 
         _bail_rows = [
-            ("BO deco sw SP [bar]",           "_deko_sw",        "1.6",
+            ("SAC [L/min]",                "_sac",            "20",
+             "Surface Air Consumption — breathing rate normalised to 1 bar.\n"
+             "Actual consumption at depth = SAC × (depth/10 + 1).\n"
+             "Used to calculate OC bailout gas usage. Typical: 15–25 L/min."),
+            ("Bailout max PO2 [bar]",           "_deko_sw",        "1.6",
              "CCR setpoint used if switching back to CCR during bailout deco stops.\n"
              "Only relevant if deco is completed on CCR after OC bailout."),
+            ("Bailout time before CCR ascent", "_bail_deco_time", "0",
+             "Minutes before the planned CCR ascent at which the diver switches to OC.\n"
+             "CCR bottom time is shortened by this amount; those minutes are spent on\n"
+             "open circuit at depth before ascending. Total bottom time is unchanged."),
+            # checkbox injected here (row 3)
+            ("Last stop [m]",                 "_bo_last_stop",   "3",
+             "Shallowest decompression stop for the bailout plan.\n"
+             "The diver holds this stop until the ceiling clears to the surface."),
             ("Stop interval [m]",             "_stop_int",       "3",
              "Depth interval between computed decompression stops.\n"
              "1 m = fine resolution, 3 m = standard DSAT schedule."),
@@ -770,21 +781,12 @@ class DivePlannerTab(QWidget):
              "Controls which stop depths are shown in the table.\n"
              "Set to 1 to see every metre, 3 to see every 3 m.\n"
              "Gas switch rows and surface are always shown."),
-            ("Bailout time before CCR ascent", "_bail_deco_time", "0",
-             "Minutes before the planned CCR ascent at which the diver switches to OC.\n"
-             "CCR bottom time is shortened by this amount; those minutes are spent on\n"
-             "open circuit at depth before ascending. Total bottom time is unchanged."),
-            # checkbox injected here (row 4)
-            ("BO GF Low [%]",                 "_bo_gf_lo",       "30",
-             "Gradient Factor Low for the bailout decompression plan.\n"
-             "Can be set higher (less conservative) than the CCR GF Low\n"
-             "for a faster emergency ascent. Buhlmann ZHL-16C parameter."),
-            ("BO GF High [%]",                "_bo_gf_hi",       "80",
-             "Gradient Factor High for the bailout decompression plan.\n"
-             "Can be set higher (less conservative) than the CCR GF High\n"
-             "for a faster emergency ascent. Buhlmann ZHL-16C parameter."),
+            ("GFL/GFH [%]",                "_bo_gf",          "30/80",
+             "Bailout Gradient Factors as GF Low / GF High, e.g. 50/80.\n"
+             "Can be set higher (less conservative) than CCR GFs\n"
+             "for a faster emergency ascent. Bühlmann ZHL-16C parameter."),
         ]
-        _CB_INSERT = 4   # row index where checkbox is inserted
+        _CB_INSERT = 3   # row index where "Ascend immediately" checkbox is inserted
         for r, row in enumerate(_bail_rows):
             _gr = r if r < _CB_INSERT else r + 1   # shift rows after checkbox down by 1
             label, attr, default = row[0], row[1], row[2]
@@ -813,44 +815,45 @@ class DivePlannerTab(QWidget):
 
         _bail_grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         gen_hl.addWidget(_bail_grp, stretch=1)
+        gen_hl.addWidget(_gen_grp, stretch=1)
 
         tabs.addTab(gen_w, "General")
 
         # ── Gas Correction tab ───────────────────────────────────────────────
         tabs.addTab(self._build_gas_correction_tab(), "Gas Correction")
 
-        # ── Save button in tab bar corner ────────────────────────────────────
+        # ── Use defaults button in tab bar corner ─────────────────────────────
         corner_w = QWidget()
         corner_hl = QHBoxLayout(corner_w)
         corner_hl.setContentsMargins(0, 0, 4, 0)
-        corner_hl.setSpacing(6)
-        self._settings_status_lbl = QLabel("")
-        self._settings_status_lbl.setStyleSheet("color:#44cc88; font-size:9px;")
-        save_btn = QPushButton("Save settings")
-        save_btn.setStyleSheet("background:#2a5a2a; color:white; font-weight:bold; padding:3px 8px;")
-        save_btn.clicked.connect(self._save_global_settings)
-        corner_hl.addWidget(self._settings_status_lbl)
-        corner_hl.addWidget(save_btn)
+        defaults_btn = QPushButton("Use defaults")
+        defaults_btn.setStyleSheet(
+            "background:#555577; color:white; font-weight:bold; padding:3px 8px;")
+        defaults_btn.setToolTip(
+            "Reset all settings to factory defaults.\n"
+            "Save the profile to keep them.")
+        defaults_btn.clicked.connect(self._use_default_settings)
+        corner_hl.addWidget(defaults_btn)
         tabs.setCornerWidget(corner_w, Qt.Corner.TopRightCorner)
 
         return box
 
-    def _save_global_settings(self):
-        """Save current settings fields to db as global settings."""
-        gs = {}
+    def _use_default_settings(self):
+        """Reset all settings fields to factory defaults."""
         for _, attr, default in self._SETTINGS_FIELDS:
             le = getattr(self, attr + "_le", None)
-            gs[attr] = le.text() if le else default
-        gs["_bail_ascend_now"] = "1" if self._bail_ascend_now_cb.isChecked() else "0"
-        self._db["global_settings"] = gs
-        from main_qt import save_db
-        save_db(self._db)
-        self._settings_status_lbl.setText("Saved ✓")
-        QTimer.singleShot(2000, lambda: self._settings_status_lbl.setText(""))
+            if le is not None:
+                le.setText(default)
+        self._bail_ascend_now_cb.setChecked(False)
 
     def _load_global_settings(self):
         """Load global settings from db into settings fields."""
         gs = self._db.get("global_settings", {})
+        # Migrate old separate GF keys to combined format
+        if "_gf" not in gs and ("_gf_lo" in gs or "_gf_hi" in gs):
+            gs["_gf"] = f"{gs.pop('_gf_lo', '30')}/{gs.pop('_gf_hi', '80')}"
+        if "_bo_gf" not in gs and ("_bo_gf_lo" in gs or "_bo_gf_hi" in gs):
+            gs["_bo_gf"] = f"{gs.pop('_bo_gf_lo', '30')}/{gs.pop('_bo_gf_hi', '80')}"
         for _, attr, default in self._SETTINGS_FIELDS:
             le = getattr(self, attr + "_le", None)
             if le:
@@ -925,6 +928,1244 @@ class DivePlannerTab(QWidget):
         gc_grid.setRowStretch(half + 1, 1)
 
         return gc_w
+
+    # ── Compare popup ─────────────────────────────────────────────────────────
+
+    def _open_compare_window(self):
+        from PyQt6.QtWidgets import QDialog
+        if hasattr(self, "_cmp_dialog") and self._cmp_dialog is not None:
+            self._cmp_dialog.show()
+            self._cmp_dialog.raise_()
+            self._cmp_dialog.activateWindow()
+            return
+        dlg = QDialog(self)
+        dlg.setWindowFlags(
+            dlg.windowFlags() |
+            Qt.WindowType.WindowMaximizeButtonHint |
+            Qt.WindowType.WindowMinimizeButtonHint)
+        dlg.setWindowTitle("Bailout Profile Comparison")
+        dlg.resize(980, 640)
+        dlg_vl = QVBoxLayout(dlg)
+        dlg_vl.setContentsMargins(8, 8, 8, 8)
+        dlg_vl.addWidget(self._build_compare_widget())
+        self._cmp_dialog = dlg
+        dlg.destroyed.connect(lambda: setattr(self, "_cmp_dialog", None))
+        self._refresh_compare_cbs()
+        dlg.show()
+
+    def _build_compare_widget(self) -> QWidget:
+        w  = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(4, 4, 4, 4)
+        vl.setSpacing(6)
+
+        # Selector row
+        sel_hl = QHBoxLayout()
+        sel_hl.setSpacing(8)
+        sel_hl.addWidget(QLabel("A:"))
+        self._cmp_a_cb = QComboBox()
+        self._cmp_a_cb.setMinimumWidth(180)
+        sel_hl.addWidget(self._cmp_a_cb, 1)
+        sel_hl.addWidget(QLabel("vs"))
+        self._cmp_b_cb = QComboBox()
+        self._cmp_b_cb.setMinimumWidth(180)
+        sel_hl.addWidget(self._cmp_b_cb, 1)
+        run_btn = QPushButton("Run ▶")
+        run_btn.setStyleSheet(
+            "background:#2255aa; color:white; font-weight:bold; padding:4px 14px;")
+        run_btn.clicked.connect(self._run_compare)
+        sel_hl.addWidget(run_btn)
+        vl.addLayout(sel_hl)
+
+        self._cmp_status_lbl = QLabel("")
+        self._cmp_status_lbl.setStyleSheet("color:#888888; font-size:8px; margin:0px;")
+        vl.addWidget(self._cmp_status_lbl)
+
+        # Horizontal split: tables left | charts right
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        vl.addWidget(splitter, 1)
+
+        # ── Left: scroll area containing three stacked tables ───────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        left_w  = QWidget()
+        left_vl = QVBoxLayout(left_w)
+        left_vl.setContentsMargins(0, 0, 4, 0)
+        left_vl.setSpacing(1)
+
+        TS = "font-size:9px;"
+        ROW_H = 15   # enforced row height for all tables
+
+        def _hdr(text):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                "font-weight:bold; color:#111111; font-size:9px; "
+                "margin-top:2px; margin-bottom:0px;")
+            return lbl
+
+        def _tbl(cols, headers, stretch_col=0):
+            t = QTableWidget(0, cols)
+            t.setHorizontalHeaderLabels(headers)
+            hh = t.horizontalHeader()
+            hh.setDefaultSectionSize(50)
+            hh.setMinimumSectionSize(30)
+            hh.setMaximumHeight(18)
+            for c in range(cols):
+                hh.setSectionResizeMode(
+                    c, QHeaderView.ResizeMode.Stretch
+                    if c == stretch_col
+                    else QHeaderView.ResizeMode.ResizeToContents)
+            vh = t.verticalHeader()
+            vh.setVisible(False)
+            vh.setDefaultSectionSize(ROW_H)
+            vh.setMinimumSectionSize(ROW_H)
+            vh.setMaximumSectionSize(ROW_H)
+            t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            t.setStyleSheet(TS)
+            return t
+
+        # Profile differences table (input params that differ)
+        left_vl.addWidget(_hdr("Profile differences"))
+        self._cmp_diff_tbl = _tbl(3, ["Parameter", "A", "B"], stretch_col=0)
+        self._cmp_diff_tbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        left_vl.addWidget(self._cmp_diff_tbl)
+
+        # Summary table — sized to fit its rows exactly (no scrollbar)
+        left_vl.addWidget(_hdr("Summary"))
+        self._cmp_sum_tbl = _tbl(4, ["Metric", "A", "B", "Better"],
+                                  stretch_col=0)
+        self._cmp_sum_tbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        left_vl.addWidget(self._cmp_sum_tbl)
+
+        # Gas consumption table
+        left_vl.addWidget(_hdr("Gas consumption (bailout)"))
+        _gas_note = QLabel("Note: gas volumes calculated at ambient pressure (reduced cylinder pressure at depth)")
+        _gas_note.setStyleSheet("font-size:8px; color:#666666; margin-bottom:1px;")
+        _gas_note.setWordWrap(True)
+        left_vl.addWidget(_gas_note)
+        self._cmp_gas_tbl = _tbl(
+            6, ["Gas", "Start [bar]", "A used", "A rem.", "B used", "B rem."],
+            stretch_col=0)
+        self._cmp_gas_tbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        left_vl.addWidget(self._cmp_gas_tbl)
+
+        # Deco stops table — takes remaining space
+        self._cmp_stops_hdr = _hdr("Deco stops")
+        left_vl.addWidget(self._cmp_stops_hdr)
+        self._cmp_stops_tbl = _tbl(
+            4, ["Depth", "A [min]", "B [min]", "Δ [min]"],
+            stretch_col=0)
+        left_vl.addWidget(self._cmp_stops_tbl)
+
+        # ── Waterfall analysis section ────────────────────────────────────────
+        left_vl.addWidget(_hdr("Waterfall analysis  (drag to reorder)"))
+        self._wf_list = QListWidget()
+        self._wf_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._wf_list.setFixedHeight(72)
+        self._wf_list.setStyleSheet(
+            "font-size:8px; color:#111; background:#f5f5f5;")
+        left_vl.addWidget(self._wf_list)
+        wf_btn = QPushButton("Run Waterfall ▶")
+        wf_btn.setStyleSheet(
+            "background:#1a6391; color:white; font-weight:bold; padding:2px 10px;")
+        wf_btn.clicked.connect(self._run_waterfall)
+        left_vl.addWidget(wf_btn)
+        self._wf_tbl = _tbl(
+            8, ["Step", "Change", "TTS", "Runtime", "Gas [L]",
+                "ΔTTS", "ΔRuntime", "ΔGas [L]"],
+            stretch_col=1)
+        self._wf_tbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        left_vl.addWidget(self._wf_tbl)
+        self._wf_patchers = []   # parallel to _wf_list items
+
+        scroll.setWidget(left_w)
+        splitter.addWidget(scroll)
+
+        # ── Right: tab widget with comparison charts + waterfall chart ────────
+        right_tabs = QTabWidget()
+        self._cmp_right_tabs = right_tabs
+        right_tabs.setStyleSheet("QTabBar::tab { font-size:9px; padding:3px 8px; }")
+
+        self._cmp_fig = _Figure(figsize=(5, 5), facecolor="#1a1a2e")
+        self._cmp_fig.subplots_adjust(
+            left=0.13, right=0.97, top=0.93, bottom=0.10, hspace=0.48)
+        self._cmp_canvas = _FigCanvas(self._cmp_fig)
+        right_tabs.addTab(self._cmp_canvas, "Charts")
+
+        self._wf_fig = _Figure(figsize=(5, 5), facecolor="#1a1a2e")
+        self._wf_fig.subplots_adjust(
+            left=0.10, right=0.97, top=0.93, bottom=0.14, hspace=0.45)
+        self._wf_canvas = _FigCanvas(self._wf_fig)
+        right_tabs.addTab(self._wf_canvas, "Waterfall chart")
+
+        splitter.addWidget(right_tabs)
+        splitter.setSizes([520, 460])
+
+        return w
+
+    def _run_waterfall(self):
+        pa = getattr(self, "_wf_params_a", None)
+        pb = getattr(self, "_wf_params_b", None)
+        if pa is None or pb is None:
+            return
+
+        sac  = self._wf_sac_a
+        cv_a = self._wf_cv_a
+        cv_b = self._wf_cv_b
+
+        # Respect the current drag-and-drop order from the list widget
+        ordered_patchers = []
+        for i in range(self._wf_list.count()):
+            lbl = self._wf_list.item(i).text()
+            # Match label back to its patcher by position in original candidate list
+            for j, stored_lbl in enumerate(
+                    [self._wf_list.item(k).text() for k in range(self._wf_list.count())]):
+                pass  # handled below
+            ordered_patchers.append((lbl, i))
+
+        # Rebuild ordered patcher list respecting UI order
+        orig_labels = [self._wf_list.item(i).text()
+                       for i in range(self._wf_list.count())]
+        if len(orig_labels) != len(self._wf_patchers):
+            return
+
+        def _sim(p):
+            return simulate_bailout_from_bottom(
+                segments=p["segments"], ccr=p.get("ccr") or pa["ccr"],
+                oc_gases=p["oc_gases"],
+                gf_low=p["bo_gf_lo"], gf_high=p["bo_gf_hi"],
+                desc_rate=p["desc_r"], asc_rate=p["asc_r"],
+                deco_rate=p["deco_r"], snap_interval=1.0,
+                stop_interval=p["stop_iv"], bail_extra=p["bail_extra"],
+                last_stop=p["bo_last_stop"])
+
+        def _total_gas(p, cur_sac):
+            from dive_planner_tab import select_oc_gas, _oc_ascent_waypoints
+            litres: dict[str, float] = {}
+            oc_gases = p.get("oc_gases", [])
+            try:
+                bail = _sim(p)
+                stops = bail.stops
+            except Exception:
+                return 0.0
+            segs = p.get("segments", [])
+            bottom_d = max((d for d, _ in segs), default=0.0) if segs else 0.0
+            asc_r  = p.get("asc_r", 9.0)
+            deco_r = p.get("deco_r", 3.0)
+
+            def _add(gas, d1, d2, t):
+                avg_d = (d1 + d2) / 2.0
+                L = cur_sac * t * (avg_d / 10.0 + 1.0)
+                litres[gas] = litres.get(gas, 0.0) + L
+
+            def _transit(d1, d2, rate):
+                if d1 <= d2 or not oc_gases: return
+                wps = _oc_ascent_waypoints(d1, d2, oc_gases)
+                prev = d1
+                for wp in wps:
+                    _add(select_oc_gas(prev, oc_gases).label(), prev, wp, (prev - wp) / rate)
+                    prev = wp
+
+            be = p.get("bail_extra", 0.0)
+            if be > 0 and bottom_d > 0 and oc_gases:
+                _add(select_oc_gas(bottom_d, oc_gases).label(), bottom_d, bottom_d, be)
+            if not stops:
+                return sum(litres.values())
+            _transit(bottom_d, stops[0].depth, asc_r)
+            for i, s in enumerate(stops):
+                _add(s.gas, s.depth, s.depth, s.time)
+                if i + 1 < len(stops):
+                    _transit(s.depth, stops[i + 1].depth, deco_r)
+            _transit(stops[-1].depth, 0.0, deco_r)
+            return sum(litres.values())
+
+        CLR_A = "#1a6391"; CLR_B = "#8b4500"; CLR_SEP = "#3a3a3a"
+        CHT_A = CLR_A;     CHT_B = CLR_B
+
+        def _item(text, bg=None, bold=False):
+            from PyQt6.QtWidgets import QTableWidgetItem
+            from PyQt6.QtGui import QColor
+            it = QTableWidgetItem(str(text))
+            it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if bg:
+                it.setBackground(QColor(bg)); it.setForeground(QColor("#ffffff"))
+            if bold:
+                f = it.font(); f.setBold(True); it.setFont(f)
+            return it
+
+        steps = []   # (label, tts, runtime, gas)
+
+        # Step 0: Profile A baseline
+        cur_p   = copy.deepcopy(pa)
+        cur_sac = sac
+        try:
+            r0 = _sim(cur_p)
+            g0 = _total_gas(cur_p, cur_sac)
+            steps.append(("A  (baseline)", r0.tts, r0.runtime, g0))
+        except Exception as e:
+            self._cmp_status_lbl.setText(f"Waterfall baseline failed: {e}"); return
+
+        # Apply each change in UI order
+        for i in range(self._wf_list.count()):
+            patcher = self._wf_patchers[i]
+            cur_p, cur_sac = patcher(cur_p, cur_sac)
+            try:
+                r = _sim(cur_p)
+                g = _total_gas(cur_p, cur_sac)
+                steps.append((self._wf_list.item(i).text(), r.tts, r.runtime, g))
+            except Exception as e:
+                steps.append((self._wf_list.item(i).text(), float("nan"),
+                               float("nan"), float("nan")))
+
+        # Final step: full Profile B (sanity check)
+        try:
+            rb = _sim(pb)
+            gb = _total_gas(pb, self._wf_sac_b)
+            steps.append(("B  (target)", rb.tts, rb.runtime, gb))
+        except Exception:
+            pass
+
+        # Populate table
+        self._wf_tbl.setRowCount(len(steps))
+        _hh = self._wf_tbl.horizontalHeader()
+        for _c in range(self._wf_tbl.columnCount()):
+            _hh.setSectionResizeMode(_c, QHeaderView.ResizeMode.Stretch)
+
+        for r, (lbl, tts, rt, gas) in enumerate(steps):
+            is_first = r == 0
+            is_last  = r == len(steps) - 1
+            bg = CLR_A if is_first else (CLR_B if is_last else None)
+            prev_tts = steps[r - 1][1] if r > 0 else tts
+            prev_rt  = steps[r - 1][2] if r > 0 else rt
+            prev_gas = steps[r - 1][3] if r > 0 else gas
+            d_tts = tts - prev_tts
+            d_rt  = rt  - prev_rt
+            d_gas = gas - prev_gas
+
+            def _fmt(v):
+                return f"{v:.1f}" if v == v else "—"   # nan check
+
+            def _dfmt(v):
+                return f"{v:+.1f}" if v == v and abs(v) > 0.05 else ("0" if v == v else "—")
+
+            self._wf_tbl.setItem(r, 0, _item(str(r), bg, bold=is_first or is_last))
+            self._wf_tbl.setItem(r, 1, _item(lbl,  bg, bold=is_first or is_last))
+            self._wf_tbl.setItem(r, 2, _item(_fmt(tts), bg))
+            self._wf_tbl.setItem(r, 3, _item(_fmt(rt),  bg))
+            self._wf_tbl.setItem(r, 4, _item(_fmt(gas), bg))
+            self._wf_tbl.setItem(r, 5, _item(_dfmt(d_tts) if not is_first else "—"))
+            self._wf_tbl.setItem(r, 6, _item(_dfmt(d_rt)  if not is_first else "—"))
+            self._wf_tbl.setItem(r, 7, _item(_dfmt(d_gas) if not is_first else "—"))
+
+        self._wf_tbl.resizeRowsToContents()
+        self._wf_tbl.setFixedHeight(
+            self._wf_tbl.horizontalHeader().height() +
+            sum(self._wf_tbl.rowHeight(r) for r in range(self._wf_tbl.rowCount())) + 4)
+
+        # ── Waterfall chart ───────────────────────────────────────────────────
+        self._wf_fig.clear()
+        ax_tts = self._wf_fig.add_subplot(2, 1, 1)
+        ax_gas = self._wf_fig.add_subplot(2, 1, 2)
+        for ax in (ax_tts, ax_gas):
+            ax.set_facecolor("#0d0d1a")
+            for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+            for sp in ("bottom", "left"): ax.spines[sp].set_color("#555")
+            ax.tick_params(colors="#cccccc", labelsize=7)
+
+        labels  = [s[0].split("  ")[0] for s in steps]   # short label
+        tts_v   = [s[1] for s in steps]
+        gas_v   = [s[3] for s in steps]
+        n_steps = len(steps)
+        xs      = list(range(n_steps))
+
+        # TTS waterfall bars: each bar starts at baseline A, coloured by Δ direction
+        tts_base = tts_v[0]
+        for i in range(n_steps):
+            col = CHT_A if i == 0 else (CHT_B if i == n_steps - 1
+                  else ("#4caf50" if tts_v[i] <= tts_v[i-1] else "#ef5350"))
+            ax_tts.bar(i, tts_v[i], color=col, alpha=0.85, width=0.6, zorder=3)
+            ax_tts.text(i, tts_v[i] + max(tts_v) * 0.02,
+                        f"{tts_v[i]:.0f}", ha="center", color="#cccccc",
+                        fontsize=6.5, zorder=4)
+
+        ax_tts.axhline(tts_v[0],  color=CHT_A, linewidth=0.8, linestyle=":", alpha=0.6)
+        ax_tts.axhline(tts_v[-1], color=CHT_B, linewidth=0.8, linestyle=":", alpha=0.6)
+        ax_tts.set_xticks(xs)
+        ax_tts.set_xticklabels(labels, rotation=25, ha="right", fontsize=6.5,
+                                color="#cccccc")
+        ax_tts.set_ylabel("TTS [min]", color="#cccccc", fontsize=7)
+        ax_tts.set_title("Cumulative effect on TTS", color="#aaddff", fontsize=9)
+        ax_tts.grid(True, axis="y", color="#1e1e3a", linewidth=0.5, linestyle=":")
+
+        # Gas waterfall bars
+        for i in range(n_steps):
+            col = CHT_A if i == 0 else (CHT_B if i == n_steps - 1
+                  else ("#4caf50" if gas_v[i] <= gas_v[i-1] else "#ef5350"))
+            ax_gas.bar(i, gas_v[i], color=col, alpha=0.85, width=0.6, zorder=3)
+            ax_gas.text(i, gas_v[i] + max(gas_v) * 0.02,
+                        f"{gas_v[i]:.0f}", ha="center", color="#cccccc",
+                        fontsize=6.5, zorder=4)
+
+        ax_gas.axhline(gas_v[0],  color=CHT_A, linewidth=0.8, linestyle=":", alpha=0.6)
+        ax_gas.axhline(gas_v[-1], color=CHT_B, linewidth=0.8, linestyle=":", alpha=0.6)
+        ax_gas.set_xticks(xs)
+        ax_gas.set_xticklabels(labels, rotation=25, ha="right", fontsize=6.5,
+                                color="#cccccc")
+        ax_gas.set_ylabel("Total gas [L]", color="#cccccc", fontsize=7)
+        ax_gas.set_title("Cumulative effect on gas consumption", color="#aaddff", fontsize=9)
+        ax_gas.grid(True, axis="y", color="#1e1e3a", linewidth=0.5, linestyle=":")
+
+        self._wf_fig.subplots_adjust(
+            left=0.10, right=0.97, top=0.93, bottom=0.18, hspace=0.55)
+        self._wf_canvas.draw()
+
+        # Switch to waterfall tab
+        if hasattr(self, "_cmp_right_tabs"):
+            self._cmp_right_tabs.setCurrentWidget(self._wf_canvas)
+
+    def _refresh_compare_cbs(self):
+        if not hasattr(self, "_cmp_a_cb"):
+            return
+        names = sorted(self._deco_profiles.keys())
+        for cb in (self._cmp_a_cb, self._cmp_b_cb):
+            cur = cb.currentText()
+            cb.blockSignals(True)
+            cb.clear()
+            for n in names:
+                cb.addItem(n)
+            if cur in names:
+                cb.setCurrentText(cur)
+            cb.blockSignals(False)
+
+    def _extract_bail_params(self, state: dict) -> tuple:
+        """Reconstruct simulate_bailout_from_bottom params from a saved profile state."""
+        segments = []
+        for seg in state.get("segments", []):
+            try:
+                d = float(seg["depth"])
+                t = float(seg["time"])
+                if d > 0:
+                    segments.append((d, t))
+            except (KeyError, ValueError):
+                pass
+        if not segments:
+            return None, "No segments in profile"
+
+        user       = self._bp_tab._current_user()
+        plan_name  = state.get("stage_plan", "—")
+        plan_state = None
+        if plan_name != "—" and user in self._db.get("users", {}):
+            plan_state = (self._db["users"][user]
+                          .get("buoyancy_plans", {}).get(plan_name))
+
+        # Diluent from plan jslots
+        dil_o2, dil_he = 21, 35
+        if plan_state:
+            jslots   = plan_state.get("jslots", [])
+            dil_name = state.get("dil_cyl_idx", "")
+            matched  = False
+            for j in jslots:
+                if j.get("sel", "") == dil_name:
+                    dil_o2  = _int_val(j.get("o2", "21"), 21)
+                    dil_he  = _int_val(j.get("he", "35"), 35)
+                    matched = True
+                    break
+            if not matched and jslots:
+                dil_o2 = _int_val(jslots[0].get("o2", "21"), 21)
+                dil_he = _int_val(jslots[0].get("he", "35"), 35)
+
+        ccr = CCRConfig(
+            setpoint   = _flt(state.get("setpoint",   "1.3"), 1.3),
+            diluent_o2 = dil_o2 / 100,
+            diluent_he = dil_he / 100,
+            sp_descend = _flt(state.get("sp_descend", "0.7"), 0.7),
+            sp_deco    = _flt(state.get("sp_deko",    "1.6"), 1.6),
+        )
+
+        # OC gases from saved switch depths + plan sslot compositions
+        oc_gases  = []
+        # gas label → {"vol": water_volume_L, "init_bar": starting_pressure}
+        cyl_vols: dict[str, dict] = {}
+        if plan_state:
+            sslots    = plan_state.get("sslots", [])
+            cyl_list  = self._db.get("cylinders", [])
+            cyl_lookup = {c.get("name"): float(c.get("volume_bottle", 0))
+                          for c in cyl_list if isinstance(c, dict)}
+            for gi in state.get("oc_gases", []):
+                if gi.get("drop", False):
+                    continue
+                sel = gi.get("stage_sel", "")
+                sw  = _flt(gi.get("sw", "999"), 999)
+                if sel.startswith("Stage"):
+                    try:
+                        si = int(sel.split()[-1]) - 1
+                        if 0 <= si < len(sslots):
+                            slot = sslots[si]
+                            o2   = _int_val(slot.get("o2", "0"), 0)
+                            he   = _int_val(slot.get("he", "0"), 0)
+                            if o2 > 0:
+                                oc_gases.append(
+                                    OCGas(o2=o2/100, he=he/100,
+                                          switch_depth=sw))
+                                hep = he
+                                lbl = ("Air" if o2 == 21 and hep == 0
+                                       else f"Nitrox {o2}" if hep == 0
+                                       else f"Trimix {o2}/{hep}")
+                                vol      = cyl_lookup.get(slot.get("sel", ""), 0.0)
+                                init_bar = _flt(slot.get("pressure", "0"), 0.0)
+                                if vol > 0:
+                                    cyl_vols[lbl] = {"vol": vol, "init_bar": init_bar}
+                    except (ValueError, IndexError):
+                        pass
+        if not oc_gases:
+            oc_gases = [OCGas(o2=0.21, he=0.0, switch_depth=999)]
+
+        def _f(key, default):
+            v = state.get(key)
+            return _flt(v, default) if v is not None else default
+
+        ccr_lo, ccr_hi = self._parse_gf_str(state.get("_gf",    "30/80"), 30, 80)
+        bo_lo,  bo_hi  = self._parse_gf_str(state.get("_bo_gf", "30/80"), 30, 80)
+
+        # Mirror SimWorker: subtract bail_extra from the deepest segment's CCR
+        # time, then pass the remainder as bail_extra to the simulation.
+        # If "Ascend immediately" is set, no OC time is spent at depth.
+        bail_extra      = _f("_bail_deco_time", 0.0)
+        ascend_now      = state.get("_bail_ascend_now", "0") == "1"
+        if bail_extra > 0.0:
+            max_d = max((d for d, _ in segments), default=0.0)
+            for i in range(len(segments) - 1, -1, -1):
+                d, t = segments[i]
+                if d >= max_d:
+                    segments[i] = (d, max(0.0, t - bail_extra))
+                    break
+        sim_bail_extra = 0.0 if ascend_now else bail_extra
+
+        return {
+            "segments":     segments,
+            "ccr":          ccr,
+            "oc_gases":     oc_gases,
+            "cyl_vols":     cyl_vols,
+            "gf_lo":        ccr_lo / 100,
+            "gf_hi":        ccr_hi / 100,
+            "bo_gf_lo":     bo_lo  / 100,
+            "bo_gf_hi":     bo_hi  / 100,
+            "desc_r":       _f("_desc_r",         20.0),
+            "asc_r":        _f("_asc_r",           9.0),
+            "deco_r":       _f("_deco_r",          3.0),
+            "stop_iv":      max(1.0, _f("_stop_int", 3.0)),
+            "snap_iv":      1.0,
+            "bail_extra":   sim_bail_extra,
+            "bo_last_stop": _f("_bo_last_stop",    3.0),
+        }, ""
+
+    def _run_compare(self):
+        name_a = self._cmp_a_cb.currentText()
+        name_b = self._cmp_b_cb.currentText()
+        if not name_a or not name_b:
+            self._cmp_status_lbl.setText("Select two profiles."); return
+        if name_a == name_b:
+            self._cmp_status_lbl.setText("Select two different profiles."); return
+
+        state_a = self._deco_profiles.get(name_a)
+        state_b = self._deco_profiles.get(name_b)
+        if not state_a or not state_b:
+            self._cmp_status_lbl.setText("Profile data missing."); return
+
+        params_a, err_a = self._extract_bail_params(state_a)
+        params_b, err_b = self._extract_bail_params(state_b)
+        if err_a:
+            self._cmp_status_lbl.setText(f"A: {err_a}"); return
+        if err_b:
+            self._cmp_status_lbl.setText(f"B: {err_b}"); return
+
+        self._cmp_status_lbl.setText("Calculating…")
+
+        def _sim(p):
+            return simulate_bailout_from_bottom(
+                segments      = p["segments"],
+                ccr           = p["ccr"],
+                oc_gases      = p["oc_gases"],
+                gf_low        = p["bo_gf_lo"],
+                gf_high       = p["bo_gf_hi"],
+                desc_rate     = p["desc_r"],
+                asc_rate      = p["asc_r"],
+                deco_rate     = p["deco_r"],
+                snap_interval = p["snap_iv"],
+                stop_interval = p["stop_iv"],
+                bail_extra    = p["bail_extra"],
+                last_stop     = p["bo_last_stop"],
+            )
+
+        try:
+            bail_a = _sim(params_a)
+        except Exception as e:
+            self._cmp_status_lbl.setText(f"Sim A failed: {e}"); return
+        try:
+            bail_b = _sim(params_b)
+        except Exception as e:
+            self._cmp_status_lbl.setText(f"Sim B failed: {e}"); return
+
+        sac_a = _flt(state_a.get("_sac", state_a.get("sac", "20")), 20.0)
+        sac_b = _flt(state_b.get("_sac", state_b.get("sac", "20")), 20.0)
+
+        def _seg_bottom_time(state):
+            segs = state.get("segments", [])
+            if not segs:
+                return 0.0
+            max_d = max((float(s.get("depth", 0)) for s in segs), default=0.0)
+            return sum(float(s.get("time", 0)) for s in segs
+                       if float(s.get("depth", 0)) >= max_d)
+
+        seg_bt_a      = _seg_bottom_time(state_a)
+        seg_bt_b      = _seg_bottom_time(state_b)
+        oc_bt_a       = params_a["bail_extra"]
+        oc_bt_b       = params_b["bail_extra"]
+        bail_cut_a    = _flt(state_a.get("_bail_deco_time", "0"), 0.0)
+        bail_cut_b    = _flt(state_b.get("_bail_deco_time", "0"), 0.0)
+        actual_bt_a   = seg_bt_a - bail_cut_a + oc_bt_a
+        actual_bt_b   = seg_bt_b - bail_cut_b + oc_bt_b
+
+        self._show_compare_results(bail_a, bail_b, name_a, name_b, sac_a, sac_b,
+                                   actual_bt_a=actual_bt_a, actual_bt_b=actual_bt_b,
+                                   oc_bt_a=oc_bt_a, oc_bt_b=oc_bt_b,
+                                   params_a=params_a, params_b=params_b,
+                                   state_a=state_a, state_b=state_b)
+        self._cmp_status_lbl.setText(f"A: {name_a}   B: {name_b}")
+
+    def _show_compare_results(self, bail_a, bail_b, name_a, name_b,
+                               sac_a=20.0, sac_b=20.0,
+                               actual_bt_a=None, actual_bt_b=None,
+                               oc_bt_a=0.0, oc_bt_b=0.0,
+                               params_a=None, params_b=None,
+                               state_a=None, state_b=None):
+        CLR_A   = "#1a6391"   # steel blue  — all A values
+        CLR_B   = "#8b4500"   # burnt sienna — all B values
+        CLR_SEP = "#3a3a3a"   # dark grey for TOTAL / separator rows
+        CHT_A   = CLR_A
+        CHT_B   = CLR_B
+
+        short_a = name_a
+        short_b = name_b
+
+        def _item(text, bg=None, bold=False):
+            it = QTableWidgetItem(str(text))
+            it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if bg:
+                it.setBackground(QColor(bg))
+                it.setForeground(QColor("#ffffff"))
+            if bold:
+                f = it.font(); f.setBold(True); it.setFont(f)
+            return it
+
+        # ── Gas consumption per-gas label ────────────────────────────────────
+        pa = params_a or {}
+        pb = params_b or {}
+        cv_a = pa.get("cyl_vols", {})
+        cv_b = pb.get("cyl_vols", {})
+
+        # ── Profile differences table ─────────────────────────────────────────
+        CLR_SAME_D = CLR_SEP
+
+        def _diff_rows():
+            rows = []
+
+            def _chk(label, va, vb, fmt=str):
+                sa, sb = fmt(va), fmt(vb)
+                if sa != sb:
+                    rows.append((label, sa, sb))
+
+            # Bottom depth
+            dep_a = max((d for d, _ in pa.get("segments", [])), default=0.0)
+            dep_b = max((d for d, _ in pb.get("segments", [])), default=0.0)
+            _chk("Bottom depth [m]", dep_a, dep_b, lambda x: f"{x:.0f}")
+
+            # Bottom time
+            _chk("Runtime to ascent [min]",
+                 actual_bt_a if actual_bt_a is not None else 0.0,
+                 actual_bt_b if actual_bt_b is not None else 0.0,
+                 lambda x: f"{x:.0f}")
+
+            # Gradient factors (bailout only — CCR GF is irrelevant post-bailout)
+            bgf_a = (state_a or {}).get("_bo_gf", f"{pa.get('bo_gf_lo',0.3)*100:.0f}/{pa.get('bo_gf_hi',0.8)*100:.0f}")
+            bgf_b = (state_b or {}).get("_bo_gf", f"{pb.get('bo_gf_lo',0.3)*100:.0f}/{pb.get('bo_gf_hi',0.8)*100:.0f}")
+            if bgf_a != bgf_b:
+                rows.append(("GF bailout (lo/hi)", bgf_a, bgf_b))
+
+            # Rates
+            _chk("Descent rate [m/min]",  pa.get("desc_r", 20.0), pb.get("desc_r", 20.0), lambda x: f"{x:.0f}")
+            _chk("Ascent rate [m/min]",   pa.get("asc_r",   9.0), pb.get("asc_r",   9.0), lambda x: f"{x:.0f}")
+            _chk("Deco rate [m/min]",     pa.get("deco_r",  3.0), pb.get("deco_r",  3.0), lambda x: f"{x:.0f}")
+
+            # Stop interval and last stop
+            _chk("Stop interval [m]",   pa.get("stop_iv",      3.0), pb.get("stop_iv",      3.0), lambda x: f"{x:.0f}")
+            _chk("Last stop [m]",       pa.get("bo_last_stop", 3.0), pb.get("bo_last_stop", 3.0), lambda x: f"{x:.0f}")
+
+            # SAC
+            _chk("SAC [L/min]", sac_a, sac_b, lambda x: f"{x:.0f}")
+
+            # Bailout mode
+            asc_a = (state_a or {}).get("_bail_ascend_now", "0") == "1"
+            asc_b = (state_b or {}).get("_bail_ascend_now", "0") == "1"
+            mode_a = "Ascend now" if asc_a else f"OC {pa.get('bail_extra', 0):.0f} min at depth"
+            mode_b = "Ascend now" if asc_b else f"OC {pb.get('bail_extra', 0):.0f} min at depth"
+            if mode_a != mode_b:
+                rows.append(("Bailout mode", mode_a, mode_b))
+
+            # OC gas list
+            def _gas_str(oc_gases):
+                return "  |  ".join(
+                    f"{g.label()} sw{g.switch_depth:.0f}m"
+                    for g in sorted(oc_gases, key=lambda g: g.switch_depth))
+            gs_a = _gas_str(pa.get("oc_gases", []))
+            gs_b = _gas_str(pb.get("oc_gases", []))
+            if gs_a != gs_b:
+                rows.append(("OC gases", gs_a, gs_b))
+
+            # Cylinder volumes and starting pressures
+            def _cyl_str(cvols):
+                return "  |  ".join(
+                    f"{g}: {info.get('vol',0):.0f}L @ {info.get('init_bar',0):.0f}bar"
+                    for g, info in sorted(cvols.items()) if isinstance(info, dict))
+            cy_a = _cyl_str(cv_a)
+            cy_b = _cyl_str(cv_b)
+            if cy_a != cy_b:
+                rows.append(("Cylinders", cy_a, cy_b))
+
+            return rows
+
+        diff_rows = _diff_rows()
+        self._cmp_diff_tbl.setHorizontalHeaderLabels(
+            ["Parameter", f"A: {short_a}", f"B: {short_b}"])
+        _dhh = self._cmp_diff_tbl.horizontalHeader()
+        for _dc in range(self._cmp_diff_tbl.columnCount()):
+            _dhh.setSectionResizeMode(_dc, QHeaderView.ResizeMode.Stretch)
+        self._cmp_diff_tbl.setRowCount(max(1, len(diff_rows)))
+        if diff_rows:
+            for r, (param, va, vb) in enumerate(diff_rows):
+                self._cmp_diff_tbl.setItem(r, 0, _item(param, bold=True))
+                self._cmp_diff_tbl.setItem(r, 1, _item(va, CLR_A))
+                self._cmp_diff_tbl.setItem(r, 2, _item(vb, CLR_B))
+        else:
+            self._cmp_diff_tbl.setItem(
+                0, 0, _item("All input parameters identical", CLR_SAME_D, bold=True))
+            self._cmp_diff_tbl.setItem(0, 1, _item("—"))
+            self._cmp_diff_tbl.setItem(0, 2, _item("—"))
+        self._cmp_diff_tbl.resizeRowsToContents()
+        self._cmp_diff_tbl.setFixedHeight(
+            self._cmp_diff_tbl.horizontalHeader().height() +
+            sum(self._cmp_diff_tbl.rowHeight(r)
+                for r in range(self._cmp_diff_tbl.rowCount())) + 4)
+
+        def _gas_usage(stops, sac, cvols, p):
+            bars: dict[str, float] = {}   # gas → bar used
+            oc_gases = p.get("oc_gases", [])
+
+            def _add_seg(gas, d_from, d_to, t_min):
+                if t_min <= 0 or not gas:
+                    return
+                avg_d  = (d_from + d_to) / 2.0
+                litres = sac * t_min * (avg_d / 10.0 + 1.0)
+                info   = cvols.get(gas, {})
+                vol    = info.get("vol", 0.0) if isinstance(info, dict) else float(info)
+                if vol > 0:
+                    bars[gas] = bars.get(gas, 0.0) + litres / vol
+
+            def _add_transit(d_from, d_to, rate):
+                """Split ascent transit at gas switch depths and charge each segment."""
+                if d_from <= d_to or not oc_gases:
+                    return
+                waypoints = _oc_ascent_waypoints(d_from, d_to, oc_gases)
+                prev = d_from
+                for wp in waypoints:
+                    seg_t = (prev - wp) / rate
+                    gas   = select_oc_gas(prev, oc_gases).label()
+                    _add_seg(gas, prev, wp, seg_t)
+                    prev  = wp
+
+            asc_r    = p.get("asc_r",  9.0)
+            deco_r   = p.get("deco_r", 3.0)
+            segs     = p.get("segments", [])
+            bottom_d = max((d for d, _ in segs), default=0.0) if segs else 0.0
+
+            # OC time at bottom before ascending
+            bail_extra = p.get("bail_extra", 0.0)
+            if bail_extra > 0 and bottom_d > 0 and oc_gases:
+                deep_gas = select_oc_gas(bottom_d, oc_gases).label()
+                _add_seg(deep_gas, bottom_d, bottom_d, bail_extra)
+
+            if not stops:
+                return bars
+
+            # Transit from bottom to first stop (at ascent rate, split at switch depths)
+            _add_transit(bottom_d, stops[0].depth, asc_r)
+
+            # Deco stops + inter-stop transits (at deco rate)
+            for i, s in enumerate(stops):
+                _add_seg(s.gas, s.depth, s.depth, s.time)
+                if i + 1 < len(stops):
+                    _add_transit(s.depth, stops[i + 1].depth, deco_r)
+
+            # Final ascent from last stop to surface
+            _add_transit(stops[-1].depth, 0.0, deco_r)
+
+            return bars
+
+        usage_a   = _gas_usage(bail_a.stops, sac_a, cv_a, pa)
+        usage_b   = _gas_usage(bail_b.stops, sac_b, cv_b, pb)
+        # Build label→switch_depth from both profiles so we can sort gases
+        # deepest first — matching the physical order of use during ascent.
+        _sw_depth: dict[str, float] = {}
+        for _p in (pa, pb):
+            for _g in _p.get("oc_gases", []):
+                _sw_depth[_g.label()] = max(
+                    _sw_depth.get(_g.label(), 0.0), _g.switch_depth)
+        all_gases = sorted(
+            set(usage_a) | set(usage_b),
+            key=lambda g: _sw_depth.get(g, 0.0),
+            reverse=True)   # deepest switch depth first
+        total_a   = sum(usage_a.values())
+        total_b   = sum(usage_b.values())
+
+        # ── Summary table ────────────────────────────────────────────────────
+        _abt_a = actual_bt_a if actual_bt_a is not None else bail_a.bottom_time
+        _abt_b = actual_bt_b if actual_bt_b is not None else bail_b.bottom_time
+        metrics = [
+            ("TTS [min]",           bail_a.tts,     bail_b.tts),
+            ("Total runtime [min]", bail_a.runtime,  bail_b.runtime),
+            ("Runtime to ascent [min]",   _abt_a,          _abt_b),
+            ("OC at depth [min]",   oc_bt_a,         oc_bt_b),
+            ("OTU",                 bail_a.otu,      bail_b.otu),
+            ("CNS [%]",             bail_a.cns,      bail_b.cns),
+            ("Total gas [bar]",     total_a,         total_b),
+        ]
+        self._cmp_sum_tbl.setRowCount(len(metrics))
+        self._cmp_sum_tbl.setHorizontalHeaderLabels(
+            ["Metric", f"A: {short_a}", f"B: {short_b}", "Δ (A−B)"])
+
+        for r, (metric, va, vb) in enumerate(metrics):
+            delta = va - vb
+            delta_txt = f"{delta:+.1f}" if delta else "0"
+            self._cmp_sum_tbl.setItem(r, 0, _item(metric))
+            self._cmp_sum_tbl.setItem(r, 1, _item(f"{va:.1f}", CLR_A))
+            self._cmp_sum_tbl.setItem(r, 2, _item(f"{vb:.1f}", CLR_B))
+            self._cmp_sum_tbl.setItem(r, 3, _item(delta_txt))
+        self._cmp_sum_tbl.resizeRowsToContents()
+        self._cmp_sum_tbl.setFixedHeight(
+            self._cmp_sum_tbl.horizontalHeader().height() +
+            sum(self._cmp_sum_tbl.rowHeight(r)
+                for r in range(self._cmp_sum_tbl.rowCount())) + 4)
+
+        # ── Gas consumption table ────────────────────────────────────────────
+        def _init_bar(cvols, gas):
+            info = cvols.get(gas, {})
+            return info.get("init_bar", 0.0) if isinstance(info, dict) else 0.0
+
+        # Use A's start pressure as the canonical start (same plan → same start)
+        # Fall back to B's if A doesn't have it
+        def _start(gas):
+            v = _init_bar(cv_a, gas) or _init_bar(cv_b, gas)
+            return v
+
+        rows_gas = [(g, _start(g), usage_a.get(g, 0.0), usage_b.get(g, 0.0))
+                    for g in all_gases]
+
+        self._cmp_gas_tbl.setRowCount(len(rows_gas) + 1)   # +1 for TOTAL
+        self._cmp_gas_tbl.setHorizontalHeaderLabels(
+            ["Gas", "Start [bar]",
+             f"A: {short_a} used", f"A: rem.",
+             f"B: {short_b} used", f"B: rem."])
+        _ghh = self._cmp_gas_tbl.horizontalHeader()
+        for _gc in range(self._cmp_gas_tbl.columnCount()):
+            _ghh.setSectionResizeMode(_gc, QHeaderView.ResizeMode.Stretch)
+
+        for r, (gas, init, ua, ub) in enumerate(rows_gas):
+            rem_a     = init - ua if init > 0 else None
+            rem_b     = init - ub if init > 0 else None
+            init_txt  = f"{init:.0f}" if init > 0 else "?"
+            rem_a_txt = f"{rem_a:.0f}" if rem_a is not None else "?"
+            rem_b_txt = f"{rem_b:.0f}" if rem_b is not None else "?"
+            self._cmp_gas_tbl.setItem(r, 0, _item(gas))
+            self._cmp_gas_tbl.setItem(r, 1, _item(init_txt))
+            self._cmp_gas_tbl.setItem(r, 2, _item(f"{ua:.0f}", CLR_A))
+            self._cmp_gas_tbl.setItem(r, 3, _item(rem_a_txt,   CLR_A))
+            self._cmp_gas_tbl.setItem(r, 4, _item(f"{ub:.0f}", CLR_B))
+            self._cmp_gas_tbl.setItem(r, 5, _item(rem_b_txt,   CLR_B))
+
+        # TOTAL row
+        tr = len(rows_gas)
+        self._cmp_gas_tbl.setItem(tr, 0, _item("TOTAL",          CLR_SEP, bold=True))
+        self._cmp_gas_tbl.setItem(tr, 1, _item("—",              CLR_SEP, bold=True))
+        self._cmp_gas_tbl.setItem(tr, 2, _item(f"{total_a:.0f}", CLR_SEP, bold=True))
+        self._cmp_gas_tbl.setItem(tr, 3, _item("—",              CLR_SEP, bold=True))
+        self._cmp_gas_tbl.setItem(tr, 4, _item(f"{total_b:.0f}", CLR_SEP, bold=True))
+        self._cmp_gas_tbl.setItem(tr, 5, _item("—",              CLR_SEP, bold=True))
+
+        self._cmp_gas_tbl.resizeRowsToContents()
+        self._cmp_gas_tbl.setFixedHeight(
+            self._cmp_gas_tbl.horizontalHeader().height() +
+            sum(self._cmp_gas_tbl.rowHeight(r)
+                for r in range(self._cmp_gas_tbl.rowCount())) + 4)
+
+        # ── Stop comparison table (banded) ───────────────────────────────────
+        # Group stops into bands sized by the coarser profile's stop interval so
+        # a 1m-interval profile doesn't create misleading zigzag vs a 3m profile.
+        def _detect_iv(stops):
+            ds = sorted(set(round(s.depth, 1) for s in stops))
+            if len(ds) < 2:
+                return 3.0
+            diffs = [round(ds[i+1] - ds[i], 1) for i in range(len(ds) - 1)]
+            return max(set(diffs), key=diffs.count)
+
+        iv_a   = _detect_iv(bail_a.stops)
+        iv_b   = _detect_iv(bail_b.stops)
+        band   = max(iv_a, iv_b, 3.0)
+
+        def _band_stops(stops, bsz):
+            bd: dict[float, float] = {}
+            for s in stops:
+                b = float(_np.ceil(s.depth / bsz) * bsz)
+                bd[b] = bd.get(b, 0.0) + s.time
+            return bd
+
+        band_a   = _band_stops(bail_a.stops, band)
+        band_b   = _band_stops(bail_b.stops, band)
+        all_bands = sorted(set(band_a) | set(band_b), reverse=True)
+
+        band_lbl = f"{band:.0f}m bands" if band > 1.0 else "1m stops"
+        self._cmp_stops_hdr.setText(f"Deco stops  ({band_lbl})")
+        self._cmp_stops_tbl.setRowCount(len(all_bands) + 1)   # +1 TOTAL
+        self._cmp_stops_tbl.setHorizontalHeaderLabels(
+            ["Depth", "A [min]", "B [min]", "Δ [min]"])
+        tot_a = tot_b = 0.0
+        for r, depth in enumerate(all_bands):
+            ta = band_a.get(depth, 0.0)
+            tb = band_b.get(depth, 0.0)
+            tot_a += ta
+            tot_b += tb
+            delta = ta - tb
+            self._cmp_stops_tbl.setItem(r, 0, _item(f"{depth:.0f} m"))
+            self._cmp_stops_tbl.setItem(r, 1, _item(f"{ta:.0f}" if ta else "—", CLR_A))
+            self._cmp_stops_tbl.setItem(r, 2, _item(f"{tb:.0f}" if tb else "—", CLR_B))
+            self._cmp_stops_tbl.setItem(r, 3, _item(f"{delta:+.0f}" if delta else "0"))
+        tr = len(all_bands)
+        tot_delta = tot_a - tot_b
+        self._cmp_stops_tbl.setItem(tr, 0, _item("TOTAL",          CLR_SEP, bold=True))
+        self._cmp_stops_tbl.setItem(tr, 1, _item(f"{tot_a:.0f}",   CLR_SEP, bold=True))
+        self._cmp_stops_tbl.setItem(tr, 2, _item(f"{tot_b:.0f}",   CLR_SEP, bold=True))
+        self._cmp_stops_tbl.setItem(tr, 3, _item(f"{tot_delta:+.0f}" if tot_delta else "0", bold=True))
+        self._cmp_stops_tbl.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._cmp_stops_tbl.setFixedHeight(
+            self._cmp_stops_tbl.horizontalHeader().height() +
+            sum(self._cmp_stops_tbl.rowHeight(r)
+                for r in range(self._cmp_stops_tbl.rowCount())) + 4)
+
+        # ── Charts: profile (top) + stop times (mid) + gas (bottom) ─────────
+        self._cmp_fig.clear()
+        self._cmp_fig.subplots_adjust(
+            left=0.11, right=0.97, top=0.96, bottom=0.07, hspace=0.55)
+        ax0 = self._cmp_fig.add_subplot(3, 1, 1)   # dive profile
+        ax1 = self._cmp_fig.add_subplot(3, 1, 2)   # deco stop times
+        ax2 = self._cmp_fig.add_subplot(3, 1, 3)   # gas consumption
+
+        # ── Profile chart (light style, y inverted) ───────────────────────────
+        def _build_profile(p, bail):
+            segs     = p.get("segments", [])
+            desc_r   = p.get("desc_r",  20.0)
+            asc_r    = p.get("asc_r",    9.0)
+            deco_r   = p.get("deco_r",   3.0)
+            bail_ext = p.get("bail_extra", 0.0)
+            ts, ds   = [0.0], [0.0]
+            cur_t = cur_d = 0.0
+            for dep, dur in segs:
+                t_transit = 0.0
+                if abs(dep - cur_d) > 0.01:
+                    t_transit = abs(dep - cur_d) / desc_r
+                    cur_t += t_transit
+                    cur_d  = dep
+                    ts.append(cur_t); ds.append(cur_d)
+                # dur is total segment time including transit (same model as simulate_dive)
+                t_at = max(0.0, dur - t_transit)
+                cur_t += t_at
+                ts.append(cur_t); ds.append(cur_d)
+            if bail_ext > 0:
+                cur_t += bail_ext
+                ts.append(cur_t); ds.append(cur_d)
+            if bail.stops:
+                cur_t += (cur_d - bail.stops[0].depth) / asc_r
+                cur_d  = bail.stops[0].depth
+                ts.append(cur_t); ds.append(cur_d)
+                for i, s in enumerate(bail.stops):
+                    if abs(s.depth - cur_d) > 0.01:
+                        cur_t += (cur_d - s.depth) / deco_r
+                        cur_d  = s.depth
+                        ts.append(cur_t); ds.append(cur_d)
+                    cur_t += s.time
+                    ts.append(cur_t); ds.append(cur_d)
+                cur_t += cur_d / deco_r
+            else:
+                cur_t += cur_d / asc_r
+            ts.append(cur_t); ds.append(0.0)
+            return ts, ds
+
+        ta_prof, da_prof = _build_profile(pa, bail_a)
+        tb_prof, db_prof = _build_profile(pb, bail_b)
+
+        # Full CCR dive using the original (unclipped) segments so the CCR
+        # profile ascent starts at the correct runtime (e.g. t=25, not t=21
+        # which would happen if bail_extra-reduced pa["segments"] were used).
+        _ccr_segs_full = []
+        for _s in (state_a or {}).get("segments", []):
+            try:
+                _d = float(_s["depth"]); _t = float(_s["time"])
+                if _d > 0:
+                    _ccr_segs_full.append((_d, _t))
+            except (KeyError, ValueError):
+                pass
+        try:
+            _ccr_gf_lo, _ccr_gf_hi = pa.get("gf_lo", 0.3), pa.get("gf_hi", 0.8)
+            _ccr_result = simulate_dive(
+                segments      = _ccr_segs_full or pa["segments"],
+                mode          = "ccr",
+                ccr           = pa["ccr"],
+                oc_gases      = pa["oc_gases"],
+                gf_low        = _ccr_gf_lo,
+                gf_high       = _ccr_gf_hi,
+                desc_rate     = pa["desc_r"],
+                asc_rate      = pa["asc_r"],
+                deco_rate     = pa["deco_r"],
+                snap_interval = 1.0,
+                stop_interval = pa["stop_iv"],
+                last_stop     = 0.0,
+            )
+            tc_prof = [pt[0] for pt in _ccr_result.tissue_timeline]
+            dc_prof = [pt[1] for pt in _ccr_result.tissue_timeline]
+        except Exception:
+            tc_prof, dc_prof = [], []
+
+        ax0.set_facecolor("#0d1a2a")
+        max_t_p = max(ta_prof[-1] if ta_prof else 0,
+                      tb_prof[-1] if tb_prof else 0, 1.0)
+        max_d_p = max(max(da_prof) if da_prof else 0,
+                      max(db_prof) if db_prof else 0, 1.0)
+
+        ax0.fill_between(ta_prof, da_prof, alpha=0.20, color=CHT_A)
+        ax0.plot(ta_prof, da_prof, color=CHT_A, linewidth=1.8,
+                 label=f"A: {name_a}")
+        ax0.plot(tb_prof, db_prof, color=CHT_B, linewidth=1.5,
+                 linestyle="--", alpha=0.9, label=f"B: {name_b}")
+
+        # CCR drawn last so it sits on top of both bailout lines
+        if tc_prof:
+            ax0.plot(tc_prof, dc_prof, color="#00e5cc", linewidth=2.2,
+                     linestyle="-", alpha=0.85, label="CCR (shared)")
+        ax0.invert_yaxis()
+        ax0.set_xlim(0, max_t_p * 1.03)
+        ax0.set_ylim(max_d_p * 1.08, -max_d_p * 0.05)
+        ax0.set_xlabel("Time [min]", fontsize=7, color="#ccddee")
+        ax0.set_ylabel("Depth [m]",  fontsize=7, color="#ccddee")
+        # major ticks every 5 min, minor every 1 min
+        import matplotlib.ticker as _mticker
+        ax0.xaxis.set_major_locator(_mticker.MultipleLocator(5))
+        ax0.xaxis.set_minor_locator(_mticker.MultipleLocator(1))
+        ax0.tick_params(axis="x", which="major", labelsize=7, colors="#ccddee")
+        ax0.tick_params(axis="x", which="minor", length=3, colors="#7799aa")
+        ax0.tick_params(axis="y", labelsize=7, colors="#ccddee")
+        ax0.grid(True, which="major", color="#2a3a4a", linewidth=0.5, linestyle=":")
+        ax0.grid(True, which="minor", color="#1e2e3e", linewidth=0.3, linestyle=":")
+        for sp in ax0.spines.values():
+            sp.set_edgecolor("#445566")
+        ax0.legend(fontsize=6.5, loc="lower right",
+                   facecolor="#1a2a3a", edgecolor="#445566",
+                   labelcolor="#ccddee")
+        ax0.set_title("Dive profiles", color="#ccddee", fontsize=8, pad=3)
+        ax0.set_facecolor("#0d1a2a")
+
+        for ax in (ax1, ax2):
+            ax.set_facecolor("#0d0d1a")
+            for sp in ("top", "right"):
+                ax.spines[sp].set_visible(False)
+            for sp in ("bottom", "left"):
+                ax.spines[sp].set_color("#555")
+            ax.tick_params(colors="#cccccc", labelsize=7)
+
+        # Top: banded stop times (same bands as the table)
+        plot_depths = list(reversed(all_bands))
+        ta_vals = [band_a.get(d, 0.0) for d in plot_depths]
+        tb_vals = [band_b.get(d, 0.0) for d in plot_depths]
+        x = _np.arange(len(plot_depths))
+        bw = 0.35
+        ax1.bar(x - bw/2, ta_vals, bw, label=f"A", color=CHT_A, alpha=0.88)
+        ax1.bar(x + bw/2, tb_vals, bw, label=f"B", color=CHT_B, alpha=0.88)
+        ax1.set_xticks(x)
+        ax1.set_xticklabels([f"{d:.0f}m" for d in plot_depths], color="#cccccc", fontsize=7)
+        ax1.set_ylabel("Stop [min]", color="#cccccc", fontsize=8)
+        ax1.set_title(f"Deco stop times ({band_lbl})", color="#aaddff", fontsize=9)
+        ax1.legend(fontsize=7, facecolor="#1a1a2e", edgecolor="#555",
+                   labelcolor="#cccccc",
+                   labels=[f"A: {name_a}", f"B: {name_b}"])
+
+        # Bottom: gas consumption — dark bg = capacity, coloured fill = remaining
+        if all_gases:
+            n        = len(all_gases)
+            grp_w    = 0.8
+            bar_w    = grp_w / 2 - 0.04
+            offsets  = [-grp_w/4, grp_w/4]
+            bar_cols = [CHT_A, CHT_B]
+            profiles = [(usage_a, cv_a, short_a), (usage_b, cv_b, short_b)]
+            max_init = max((_start(g) for g in all_gases), default=1.0) or 1.0
+
+            for gi, gas in enumerate(all_gases):
+                init = _start(gas)
+                for pi, (usage, cvols, pname) in enumerate(profiles):
+                    used   = usage.get(gas, 0.0)
+                    remain = max(0.0, init - used)
+                    col    = bar_cols[pi]
+                    xpos   = gi + offsets[pi]
+
+                    # Dark background = full capacity
+                    ax2.bar(xpos, max(init, max_init * 0.04), width=bar_w,
+                            color="#1a1a2e", edgecolor="#2a2a4a",
+                            linewidth=0.5, zorder=2)
+                    # A/B coloured fill = remaining
+                    if init > 0:
+                        ax2.bar(xpos, remain, width=bar_w,
+                                color=col, alpha=0.88, zorder=3)
+                        if used >= 1.0:
+                            ax2.text(xpos, remain + used / 2,
+                                     f"{used:.0f}", ha="center", va="center",
+                                     color="#e0e0e0", fontsize=6, zorder=4)
+                        if remain >= max_init * 0.10:
+                            ax2.text(xpos, remain / 2,
+                                     f"{remain:.0f}", ha="center", va="center",
+                                     color="#ffffff", fontsize=6,
+                                     fontweight="bold", zorder=4)
+
+                # Gas label + profile labels below each group
+                ax2.text(gi - grp_w/4, -max_init * 0.08, "A",
+                         ha="center", va="top", color=CHT_A, fontsize=6.5)
+                ax2.text(gi + grp_w/4, -max_init * 0.08, "B",
+                         ha="center", va="top", color=CHT_B, fontsize=6.5)
+                ax2.text(gi, -max_init * 0.19, gas,
+                         ha="center", va="top", color="#99aacc", fontsize=6.5)
+
+            ax2.set_xticks([])
+            ax2.set_xlim(-0.6, n - 0.4)
+            ax2.set_ylim(-max_init * 0.08, max_init * 1.15)
+            ax2.set_ylabel("bar", color="#cccccc", fontsize=7)
+            ax2.set_title("Gas consumption (bailout)", color="#aaddff", fontsize=9)
+            ax2.grid(True, axis="y", color="#1e1e3a", linewidth=0.5, linestyle=":")
+            for sp in ax2.spines.values():
+                sp.set_edgecolor("#2a2a4a")
+
+        self._cmp_canvas.draw()
+
+        # ── Waterfall: build ordered patcher list ─────────────────────────────
+        # Store everything the waterfall runner will need
+        self._wf_params_a = copy.deepcopy(pa)
+        self._wf_params_b = copy.deepcopy(pb)
+        self._wf_sac_a    = sac_a
+        self._wf_sac_b    = sac_b
+        self._wf_cv_a     = cv_a
+        self._wf_cv_b     = cv_b
+
+        def _gas_lbl(oc_gases):
+            return " | ".join(
+                f"{g.label()} sw{g.switch_depth:.0f}m"
+                for g in sorted(oc_gases, key=lambda g: g.switch_depth))
+
+        # Build ordered candidate list — only include params that actually differ
+        candidates = []   # (display_label, patcher_fn)
+
+        def _differ_f(key):
+            return abs(pa.get(key, 0.0) - pb.get(key, 0.0)) > 0.01
+
+        # 1 — Bottom time / segments (compare raw sim segments, not actual_bt which
+        #     folds in OC time — that is already handled by the bailout mode patcher)
+        dep_a  = max((d for d, _ in pa.get("segments", [])), default=0.0)
+        dep_b  = max((d for d, _ in pb.get("segments", [])), default=0.0)
+        ccr_bt_a = sum(t for d, t in pa.get("segments", []) if d >= dep_a)
+        ccr_bt_b = sum(t for d, t in pb.get("segments", []) if d >= dep_b)
+        if abs(dep_a - dep_b) > 0.5 or abs(ccr_bt_a - ccr_bt_b) > 0.5:
+            _segs_b = copy.deepcopy(pb["segments"])
+            def _p_bt(p, sac, _sb=_segs_b):
+                p = copy.deepcopy(p); p["segments"] = copy.deepcopy(_sb); return p, sac
+            candidates.append((
+                f"Bottom time  {dep_a:.0f}m/{ccr_bt_a:.0f}→{ccr_bt_b:.0f} min CCR",
+                _p_bt))
+
+        # 2 — Bailout mode
+        be_a = pa.get("bail_extra", 0.0)
+        be_b = pb.get("bail_extra", 0.0)
+        if abs(be_a - be_b) > 0.1:
+            def _p_bail(p, sac, _be=be_b):
+                p = copy.deepcopy(p); p["bail_extra"] = _be; return p, sac
+            candidates.append((f"Bailout mode  OC {be_a:.0f}→{be_b:.0f} min at depth", _p_bail))
+
+        # 3 — GF bailout
+        if abs(pa.get("bo_gf_lo", 0) - pb.get("bo_gf_lo", 0)) > 0.005 or \
+           abs(pa.get("bo_gf_hi", 0) - pb.get("bo_gf_hi", 0)) > 0.005:
+            _gflo_b = pb["bo_gf_lo"]; _gfhi_b = pb["bo_gf_hi"]
+            _gflo_a = pa["bo_gf_lo"]; _gfhi_a = pa["bo_gf_hi"]
+            def _p_gf(p, sac, _lo=_gflo_b, _hi=_gfhi_b):
+                p = copy.deepcopy(p); p["bo_gf_lo"] = _lo; p["bo_gf_hi"] = _hi; return p, sac
+            candidates.append((
+                f"GF bailout  {_gflo_a*100:.0f}/{_gfhi_a*100:.0f}→"
+                f"{_gflo_b*100:.0f}/{_gfhi_b*100:.0f}", _p_gf))
+
+        # 4 — OC gases
+        if _gas_lbl(pa.get("oc_gases", [])) != _gas_lbl(pb.get("oc_gases", [])):
+            _og_b = copy.deepcopy(pb["oc_gases"]); _cv_b2 = copy.deepcopy(pb["cyl_vols"])
+            def _p_gases(p, sac, _og=_og_b, _cv=_cv_b2):
+                p = copy.deepcopy(p)
+                p["oc_gases"]  = copy.deepcopy(_og)
+                p["cyl_vols"]  = copy.deepcopy(_cv)
+                return p, sac
+            candidates.append(("OC gases", _p_gases))
+
+        # 5 — Rates
+        for _key, _lbl in [("desc_r","Descent rate"), ("asc_r","Ascent rate"), ("deco_r","Deco rate")]:
+            if _differ_f(_key):
+                _va = pa.get(_key, 0); _vb = pb.get(_key, 0)
+                def _p_rate(p, sac, _k=_key, _v=_vb):
+                    p = copy.deepcopy(p); p[_k] = _v; return p, sac
+                candidates.append((f"{_lbl}  {_va:.0f}→{_vb:.0f} m/min", _p_rate))
+
+        # 6 — Stop interval
+        if _differ_f("stop_iv"):
+            _si_a = pa.get("stop_iv",3); _si_b = pb.get("stop_iv",3)
+            def _p_si(p, sac, _v=_si_b):
+                p = copy.deepcopy(p); p["stop_iv"] = _v; return p, sac
+            candidates.append((f"Stop interval  {_si_a:.0f}→{_si_b:.0f} m", _p_si))
+
+        # 7 — Last stop
+        if _differ_f("bo_last_stop"):
+            _ls_a = pa.get("bo_last_stop",3); _ls_b = pb.get("bo_last_stop",3)
+            def _p_ls(p, sac, _v=_ls_b):
+                p = copy.deepcopy(p); p["bo_last_stop"] = _v; return p, sac
+            candidates.append((f"Last stop  {_ls_a:.0f}→{_ls_b:.0f} m", _p_ls))
+
+        # 8 — SAC rate (gas only, no deco effect)
+        if abs(sac_a - sac_b) > 0.5:
+            def _p_sac(p, sac, _v=sac_b):
+                return copy.deepcopy(p), _v
+            candidates.append((f"SAC rate  {sac_a:.0f}→{sac_b:.0f} L/min", _p_sac))
+
+        self._wf_patchers = [fn for _, fn in candidates]
+        self._wf_list.clear()
+        for lbl, _ in candidates:
+            self._wf_list.addItem(lbl)
+        self._wf_tbl.setRowCount(0)
 
     # ── CCR Tissue Saturations panel ──────────────────────────────────────────
 
@@ -1109,8 +2350,8 @@ class DivePlannerTab(QWidget):
         CCR_SP   = self._get_setting("_sp",       1.3)
         DIL_O2   = _int_val(self._dil_o2, 21)
         DIL_HE   = _int_val(self._dil_he, 35)
-        GF_LO    = self._get_setting("_gf_lo",   55)
-        GF_HI    = self._get_setting("_gf_hi",   70)
+        GF_LO    = self._gf_lo_val(30)
+        GF_HI    = self._gf_hi_val(80)
         DESC_R   = self._get_setting("_desc_r",  22)
         ASC_R    = self._get_setting("_asc_r",    9)
         DECO_R   = self._get_setting("_deco_r",   3)
@@ -1402,6 +2643,35 @@ class DivePlannerTab(QWidget):
             return default
         return _flt(le.text(), default)
 
+    @staticmethod
+    def _parse_gf_str(text: str, default_lo: int = 30, default_hi: int = 80):
+        """Parse 'GFL/GFH' string like '30/80' → (30, 80). Single value sets both."""
+        txt = str(text).strip()
+        if "/" in txt:
+            parts = txt.split("/", 1)
+            lo = max(1, min(100, int(_flt(parts[0].strip(), default_lo))))
+            hi = max(1, min(100, int(_flt(parts[1].strip(), default_hi))))
+        else:
+            v  = max(1, min(100, int(_flt(txt, default_lo))))
+            lo = hi = v
+        return lo, hi
+
+    def _gf_lo_val(self, default: int = 30) -> int:
+        le = getattr(self, "_gf_le", None)
+        return self._parse_gf_str(le.text() if le else f"{default}/{default}")[0]
+
+    def _gf_hi_val(self, default: int = 80) -> int:
+        le = getattr(self, "_gf_le", None)
+        return self._parse_gf_str(le.text() if le else f"{default}/{default}")[1]
+
+    def _bo_gf_lo_val(self, default: int = 30) -> int:
+        le = getattr(self, "_bo_gf_le", None)
+        return self._parse_gf_str(le.text() if le else f"{default}/{default}")[0]
+
+    def _bo_gf_hi_val(self, default: int = 80) -> int:
+        le = getattr(self, "_bo_gf_le", None)
+        return self._parse_gf_str(le.text() if le else f"{default}/{default}")[1]
+
     # ── Onboard Gas panel ─────────────────────────────────────────────────────
 
     def _build_onboard(self, grid_layout, grid_row, grid_col):
@@ -1538,6 +2808,7 @@ class DivePlannerTab(QWidget):
         tissue_hl.addWidget(self._build_ccr_tissue_sat())
         tissue_hl.addWidget(self._build_bail_tissue_sat())
         self._chart_tabs.addTab(tissue_tab, "Tissue saturations")
+
 
         outer_hl.addWidget(self._chart_tabs, stretch=1)
         outer_hl.setContentsMargins(0, 0, 0, 0)
@@ -2191,8 +3462,9 @@ class DivePlannerTab(QWidget):
             bp_plan = self._bp_tab._current_plan()
             if bp_plan and bp_plan != "—":
                 self.sync_plan(bp_plan)
-        # Always restore global settings (profiles must not override them)
-        self._load_global_settings()
+        # Global settings are a fallback — only apply when no profile is loaded
+        if not self._selected_profile:
+            self._load_global_settings()
         self._sync_suit_vol_from_plan(self._stage_plan_cb.currentText())
 
     def _refresh_stage_plan_cb(self):
@@ -2237,6 +3509,7 @@ class DivePlannerTab(QWidget):
                 if state:
                     self._load_state(state)
         self._profile_lbl.setText(self._selected_profile or "No profile selected")
+        self._refresh_compare_cbs()
 
     def _on_profile_select(self, row: int):
         if row < 0:
@@ -2268,12 +3541,11 @@ class DivePlannerTab(QWidget):
                 pass
         o2 = self._dil_o2.strip()
         he = self._dil_he.strip()
-        seg = f"{best_depth}m {best_time}min" if best_depth and best_time else "?m ?min"
-        mix = f"{o2}/{he}"
-        gflo = self._gf_lo_le.text().strip()
-        gfhi = self._gf_hi_le.text().strip()
-        gf   = f" GF{gflo}/{gfhi}" if gflo and gfhi else ""
-        return f"{seg} {mix}{gf}"
+        seg  = f"{best_depth}m {best_time}min" if best_depth and best_time else "?m ?min"
+        mix  = f"{o2}/{he}"
+        plan = self._stage_plan_cb.currentText()
+        plan_part = f" {plan}" if plan and plan != "—" else ""
+        return f"{seg} {mix}{plan_part}"
 
     def _save_profile(self):
         user = self._bp_tab._current_user()
@@ -2281,9 +3553,13 @@ class DivePlannerTab(QWidget):
             return
         new_name = self._auto_profile_name()
         old_name = self._selected_profile
-        # Rename old entry if name changed
+        # Rename old entry if name changed — but only if the new name isn't already taken
+        # by a different profile (e.g. old_name is "foo (2)" and new_name "foo" already exists)
         if old_name and old_name in self._deco_profiles and old_name != new_name:
-            self._deco_profiles.pop(old_name)
+            if new_name not in self._deco_profiles:
+                self._deco_profiles.pop(old_name)
+            else:
+                new_name = old_name   # keep existing custom name, just update state
         self._selected_profile = new_name
         self._profile_lbl.setText(new_name)
         self._deco_profiles[new_name] = self._get_state()
@@ -2324,19 +3600,7 @@ class DivePlannerTab(QWidget):
         self._refresh_profile_list()
 
     def _get_state(self) -> dict:
-        return {
-            "setpoint":   self._sp_le.text(),
-            "sp_descend": self._sp_desc_le.text(),
-            "sp_deko":    self._sp_deco_le.text(),
-            "gf_lo":      self._gf_lo_le.text(),
-            "gf_hi":      self._gf_hi_le.text(),
-            "desc_r":     self._desc_r_le.text(),
-            "asc_r":      self._asc_r_le.text(),
-            "deco_r":     self._deco_r_le.text(),
-            "sac":        self._sac_le.text(),
-            "deko_sw_po2":self._deko_sw_le.text(),
-            "stop_int":     self._stop_int_le.text(),
-            "display_int":  self._display_int_le.text(),
+        state = {
             "segments": [{"depth": r["depth_le"].text(),
                           "time":  r["time_le"].text()}
                          for r in self._seg_rows],
@@ -2355,10 +3619,27 @@ class DivePlannerTab(QWidget):
             "result_summary": self._ccr_summary_lbl.text(),
             "result_stops":   self._saved_stops,
         }
+        # All settings fields — stored per-profile
+        for _, attr, _ in self._SETTINGS_FIELDS:
+            le = getattr(self, attr + "_le", None)
+            if le is not None:
+                state[attr] = le.text()
+        state["_bail_ascend_now"] = (
+            "1" if self._bail_ascend_now_cb.isChecked() else "0")
+        return state
 
     def _load_state(self, s: dict):
         self._loading = True
-        # Settings are global — not loaded from profiles
+        # Settings — per-profile; fall back to global defaults for old profiles
+        if any(attr in s for _, attr, _ in self._SETTINGS_FIELDS):
+            for _, attr, default in self._SETTINGS_FIELDS:
+                le = getattr(self, attr + "_le", None)
+                if le is not None:
+                    le.setText(s.get(attr, default))
+            self._bail_ascend_now_cb.setChecked(
+                s.get("_bail_ascend_now", "0") == "1")
+        else:
+            self._load_global_settings()
 
         # Segments
         for row in list(self._seg_rows):
@@ -2598,7 +3879,6 @@ class DivePlannerTab(QWidget):
         ax.set_ylim(max_d * 1.08, -max_d * 0.05)
         ax.tick_params(labelsize=7, colors="#334455")
         ax.grid(True, color=BG_GRID, linewidth=0.5, linestyle=":")
-        ax.set_title("Dykkeprofil", fontsize=8, color="#223344", pad=3)
         for sp in ax.spines.values():
             sp.set_edgecolor("#aabbcc")
         if t_bail:
@@ -2918,7 +4198,7 @@ class DivePlannerTab(QWidget):
         from gf_comparison import GFComparisonWindow
         win = GFComparisonWindow(
             self, segments=segments, ccr=ccr, oc_gases=[],
-            gf_hi   = self._get_setting("_gf_hi",  80) / 100,
+            gf_hi   = self._gf_hi_val(80) / 100,
             desc_r  = self._get_setting("_desc_r", 20),
             asc_r   = self._get_setting("_asc_r",   9),
             deco_r  = self._get_setting("_deco_r",  3),
@@ -3089,16 +4369,19 @@ class DivePlannerTab(QWidget):
         if not oc_gases:
             oc_gases = [OCGas(o2=0.21, he=0.0, switch_depth=999)]
 
-        gf_lo    = self._get_setting("_gf_lo",    30) / 100
-        gf_hi    = self._get_setting("_gf_hi",    80) / 100
-        bo_gf_lo = self._get_setting("_bo_gf_lo", 30) / 100
-        bo_gf_hi = self._get_setting("_bo_gf_hi", 80) / 100
+        gf_lo    = self._gf_lo_val(30)    / 100
+        gf_hi    = self._gf_hi_val(80)    / 100
+        bo_gf_lo = self._bo_gf_lo_val(30) / 100
+        bo_gf_hi = self._bo_gf_hi_val(80) / 100
         desc_r   = self._get_setting("_desc_r", 20)
         asc_r    = self._get_setting("_asc_r",  9)
         deco_r   = self._get_setting("_deco_r",  3)
-        _snap_iv   = max(0.1, self._get_setting("_heatmap_int", 1.0))
-        _stop_iv   = max(1.0, self._get_setting("_stop_int",    3.0))
-        _last_stop = max(0.0, self._get_setting("_last_stop",   3.0))
+        _snap_iv        = max(0.1, self._get_setting("_heatmap_int",      1.0))
+        _stop_iv        = max(1.0, self._get_setting("_stop_int",         3.0))
+        _ccr_stop_iv    = max(1.0, self._get_setting("_ccr_stop_int",     3.0))
+        _ccr_display_iv = max(1,   int(self._get_setting("_ccr_display_int", 3)))
+        _last_stop    = max(0.0, self._get_setting("_last_stop",      3.0))
+        _bo_last_stop = max(0.0, self._get_setting("_bo_last_stop",   3.0))
         _bail_extra = max(0.0, self._get_setting("_bail_deco_time", 0.0))
         _bail_ascend_now = self._bail_ascend_now_cb.isChecked()
 
@@ -3117,7 +4400,10 @@ class DivePlannerTab(QWidget):
             "deco_r":         deco_r,
             "snap_iv":        _snap_iv,
             "stop_iv":        _stop_iv,
+            "ccr_stop_iv":    _ccr_stop_iv,
+            "ccr_display_iv": _ccr_display_iv,
             "last_stop":      _last_stop,
+            "bo_last_stop":   _bo_last_stop,
             "bail_extra":     _bail_extra,
             "bail_ascend_now": _bail_ascend_now,
         }
@@ -3158,8 +4444,9 @@ class DivePlannerTab(QWidget):
         # ── CCR simulation results ────────────────────────────────────────────
         result = r.get("result")
         if result is not None:
+            _rt_to_asc = _SimWorker._ccr_bottom_rt(p)
             self._ccr_summary_lbl.setText(
-                f"Bottom time: {result.bottom_time:.0f} min  |  "
+                f"Runtime to ascent: {_rt_to_asc:.0f} min  |  "
                 f"TTS: {result.tts:.0f} min  |  "
                 f"Runtime: {result.runtime:.0f} min  |  "
                 f"OTU: {result.otu:.0f}  |  CNS: {result.cns:.1f} %"
@@ -3297,27 +4584,7 @@ class DivePlannerTab(QWidget):
         _dil_factor      = 1.0 + self._get_setting("_dil_correction",  50.0) / 100.0
         _o2_factor       = 1.0 + self._get_setting("_o2_correction",   50.0) / 100.0
         _infl_factor     = 1.0 + self._get_setting("_infl_correction", 50.0) / 100.0
-        _mask_clear_vol  = self._get_setting("_mask_clear_vol",  0.5)
-        _deco_refill_vol = self._get_setting("_deco_refill_vol", 7.0)
         _max_plan_depth  = max((d for d, _ in segments), default=0.0) if segments else 0.0
-
-        _once = {"mask_clear": False, "deco_refill": False}
-
-        def _apply_mask_clear():
-            if _once["mask_clear"]:
-                return
-            _once["mask_clear"] = True
-            p_max  = P_SURF + _max_plan_depth * WATER_DENSITY / 10.0
-            used_L = _mask_clear_vol * p_max
-            if dil_cv > 0:
-                _rp["dil"] = max(0.0, _rp["dil"] - used_L / dil_cv)
-
-        def _apply_deco_refill():
-            if _once["deco_refill"]:
-                return
-            _once["deco_refill"] = True
-            if o2_cv > 0:
-                _rp["o2"] = max(0.0, _rp["o2"] - _deco_refill_vol / o2_cv)
 
         def _consume_ccr(time_min, from_depth, to_depth, row_buoy_kg=None):
             """Deduct gas for a segment from running cylinder pressures."""
@@ -3404,8 +4671,6 @@ class DivePlannerTab(QWidget):
                     label_tr   = f"{'↓' if going_down else '↑'}{cur_d:.0f}→{seg_depth:.0f}m"
                     cur_rt    += t_travel
                     _consume_ccr(t_travel, cur_d, seg_depth)
-                    if going_down and seg_depth >= _max_plan_depth:
-                        _apply_mask_clear()
                     ccr_display.append({"_label": label_tr, "depth": seg_depth,
                                         "time": t_travel, "runtime": cur_rt, "gas": dil_mix})
                     ccr_extra.append(_onboard_extra(sp_label=sp_tr,
@@ -3464,8 +4729,6 @@ class DivePlannerTab(QWidget):
                     t_asc = (cur_d - s["depth"]) / deco_r
                     _consume_ccr(t_asc, cur_d, s["depth"])
                     cur_d = s["depth"]
-                if s["depth"] <= 6.0:
-                    _apply_deco_refill()
                 _consume_ccr(s.get("time", 0), s["depth"], s["depth"])
                 sp_lbl = s["gas"].split(" dil")[0] if " dil" in s["gas"] else s["gas"]
                 ccr_display.append({**s, "gas": dil_mix})
@@ -3482,7 +4745,8 @@ class DivePlannerTab(QWidget):
 
         self._render_stops(ccr_display, self._ccr_table_area,
                            extra_data=ccr_extra if ccr_extra else None,
-                           has_pre_gas=True)
+                           has_pre_gas=True,
+                           disp_int=p.get("ccr_display_iv", 3))
 
         # ── Bailout simulation results ────────────────────────────────────────
         bail_stops = []
@@ -3959,10 +5223,6 @@ class DivePlannerTab(QWidget):
                 infl_used += bcd_used
                 bcd_used   = 0.0
 
-            # One-time events: mask clear (diluent at depth) and deco refill (O2 at surface)
-            dil_used += _mask_clear_vol * p_bottom
-            o2_used  += _deco_refill_vol
-
             def _parse_vol(s):
                 try:    return float(str(s).strip())
                 except: return 0.0
@@ -3995,11 +5255,12 @@ class DivePlannerTab(QWidget):
     # ── Render stop rows ──────────────────────────────────────────────────────
 
     def _render_stops(self, stops: list, inner: QWidget,
-                      extra_data: list, has_pre_gas: bool):
+                      extra_data: list, has_pre_gas: bool, disp_int: int = None):
         """Render result rows into the inner widget."""
         # Apply display interval filter — keep nav/drop markers always;
         # for real stops only keep depths that are multiples of display_interval.
-        disp_int = max(1, int(self._get_setting("_display_int", 3)))
+        if disp_int is None:
+            disp_int = max(1, int(self._get_setting("_display_int", 3)))
         filtered_pairs = [
             (s, extra_data[i] if (extra_data and i < len(extra_data)) else [])
             for i, s in enumerate(stops)

@@ -472,6 +472,7 @@ def simulate_bailout_from_bottom(
     snap_interval: float = 1.0,
     stop_interval: float = 3.0,
     bail_extra:    float = 0.0,
+    last_stop:     float = 0.0,
 ) -> DiveResult:
     """
     Worst-case bailout: simulate CCR bottom phase (descent + segments),
@@ -602,6 +603,8 @@ def simulate_bailout_from_bottom(
 
     while depth > 0.0:
         next_stop = max(0.0, depth - stop_interval)
+        if last_stop > 0.0 and next_stop < last_stop:
+            next_stop = 0.0
         stop_t    = 0.0
         gf = gf_high + (gf_low - gf_high) * (depth / first_stop)
         gf = max(gf_low, min(gf_high, gf))

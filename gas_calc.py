@@ -615,8 +615,9 @@ def scrubber_remaining(
     scrubber_type: str,
     mass_kg: float,
     temp_C: float,
-    depth_m: float,
+    rmv_L_min: float,
     elapsed_min: float,
+    fco2_exhaled: float = 0.04,
 ) -> Dict[str, Any]:
     """
     Estimate scrubber CO₂ absorption capacity remaining.
@@ -632,33 +633,44 @@ def scrubber_remaining(
     referencing manufacturer specifications and independent test data.
     Always apply a conservative safety margin (≥ 20% buffer).
 
-    Base capacity (Sofnolime 797, 20°C, 1 bar): ≈ 100 min·L/kg
-    Temperature correction: × (1 + 0.02 × (T − 20))
-    Depth/pressure factor:  × (1 + 0.1 × depth/10)
+    CO₂ production:  VCO₂ [L/min] = RMV × fCO₂_exhaled  (default fCO₂ = 4 %)
+    CO₂ load:        VCO₂ × elapsed_min
+    Base capacity (Sofnolime 797, 20°C): 58 L CO₂/kg
+      Calibrated to JJ-CCR 2.5 kg canister ≈ 3 h at RMV = 20 L/min, 20°C.
+    Temperature correction: × (1 + 0.02 × (T − 20)), clamped [0.4, 2.0]
+    Depth is NOT a factor: metabolic CO₂ production is depth-independent
+      when RMV is expressed in surface-equivalent litres.
 
     Parameters
     ----------
     scrubber_type : String label (currently only "Sofnolime 797" supported)
     mass_kg       : Mass of absorbent [kg]
     temp_C        : Water temperature [°C]
-    depth_m       : Operating depth [m] (representative)
+    rmv_L_min     : Respiratory minute volume [L/min, surface-equivalent]
     elapsed_min   : Elapsed dive time [min]
+    fco2_exhaled  : CO₂ fraction in exhaled gas (default 0.04 = 4 %)
 
     Returns
     -------
-    dict: {capacity_min, elapsed_min, remaining_min, pct_used, warning_level}
+    dict: {capacity_min, elapsed_min, remaining_min, pct_used, warning_level,
+           vco2_L_min, co2_load_L, capacity_L}
     warning_level: "ok" (< 70%), "caution" (70–85%), "warning" (> 85%)
     """
-    # Base capacity [min] per kg
-    base_capacity_per_kg = 100.0   # conservative; data range 80-130
+    # Sofnolime 797 base capacity [L CO₂/kg] at 20°C, fully wetted diving canister.
+    # Calibrated to JJ-CCR: 2.5 kg canister rated 180 min at RMV=40 L/min in cold water
+    # (4°C, temp_factor=0.68): 1.6 L/min × 180 min / (2.5 kg × 0.68) ≈ 170 L/kg.
+    base_L_per_kg = 170.0
 
-    temp_factor  = 1.0 + 0.02 * (temp_C - 20.0)
-    temp_factor  = max(0.4, min(2.0, temp_factor))   # clamp
-    depth_factor = 1.0 + 0.1 * (depth_m / 10.0)
+    temp_factor = max(0.4, min(2.0, 1.0 + 0.02 * (temp_C - 20.0)))
 
-    capacity_total_min = mass_kg * base_capacity_per_kg * temp_factor * depth_factor
-    remaining_min = max(0.0, capacity_total_min - elapsed_min)
-    pct_used = min(100.0, (elapsed_min / capacity_total_min * 100.0) if capacity_total_min > 0 else 100.0)
+    capacity_L   = mass_kg * base_L_per_kg * temp_factor
+    vco2_L_min   = max(0.001, rmv_L_min * fco2_exhaled)
+    co2_load_L   = vco2_L_min * elapsed_min
+
+    capacity_min  = capacity_L / vco2_L_min
+    remaining_L   = max(0.0, capacity_L - co2_load_L)
+    remaining_min = remaining_L / vco2_L_min
+    pct_used      = min(100.0, co2_load_L / capacity_L * 100.0) if capacity_L > 0 else 100.0
 
     if pct_used < 70.0:
         warning_level = "ok"
@@ -668,14 +680,16 @@ def scrubber_remaining(
         warning_level = "warning"
 
     return {
-        "scrubber_type":    scrubber_type,
-        "capacity_min":     round(capacity_total_min, 1),
-        "elapsed_min":      elapsed_min,
-        "remaining_min":    round(remaining_min, 1),
-        "pct_used":         round(pct_used, 1),
-        "warning_level":    warning_level,
-        "temp_factor":      round(temp_factor, 3),
-        "depth_factor":     round(depth_factor, 3),
+        "scrubber_type":  scrubber_type,
+        "vco2_L_min":     round(vco2_L_min, 3),
+        "co2_load_L":     round(co2_load_L, 1),
+        "capacity_L":     round(capacity_L, 1),
+        "capacity_min":   round(capacity_min, 1),
+        "elapsed_min":    elapsed_min,
+        "remaining_min":  round(remaining_min, 1),
+        "pct_used":       round(pct_used, 1),
+        "warning_level":  warning_level,
+        "temp_factor":    round(temp_factor, 3),
     }
 
 
