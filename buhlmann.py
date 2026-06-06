@@ -640,6 +640,307 @@ def simulate_bailout_from_bottom(
                       first_stop_depth=first_stop)
 
 
+def _gas_litres_per_gas(
+    result:     DiveResult,
+    oc_gases:   List[OCGas],
+    sac:        float,
+    bail_extra: float = 0.0,
+    bottom_d:   float = 0.0,
+    asc_rate:   float = 9.0,
+    deco_rate:  float = 3.0,
+) -> dict:
+    """
+    Aggregate gas consumption per OCGas label from a DiveResult produced by
+    simulate_bailout_from_bottom, using SAC-based depth-weighted calculation.
+
+    Arguments:
+        result      -- DiveResult from simulate_bailout_from_bottom
+        oc_gases    -- same OCGas list passed to the simulation
+        sac         -- surface air consumption [L/min]
+        bail_extra  -- OC minutes spent at bottom_d before ascending (default 0)
+        bottom_d    -- depth [m] at which bail_extra was breathed (default 0)
+        asc_rate    -- ascent rate [m/min] used in the simulation (default 9)
+        deco_rate   -- deco transit rate [m/min] used in the simulation (default 3)
+
+    Returns:
+        {gas_label: total_litres_at_surface_pressure}
+        Litres are computed as: SAC × time × (avg_depth / 10 + 1)
+        No cylinder-volume conversion — caller converts to bar if needed.
+    """
+    litres: dict = {}
+    stops = result.stops
+
+    def _add(gas_label: str, d_from: float, d_to: float, t_min: float) -> None:
+        if t_min <= 0 or not gas_label:
+            return
+        avg_d = (d_from + d_to) / 2.0
+        L = sac * t_min * (avg_d / 10.0 + 1.0)
+        litres[gas_label] = litres.get(gas_label, 0.0) + L
+
+    def _transit(d_from: float, d_to: float, rate: float) -> None:
+        if d_from <= d_to or not oc_gases:
+            return
+        waypoints = _oc_ascent_waypoints(d_from, d_to, oc_gases)
+        prev = d_from
+        for wp in waypoints:
+            seg_t = (prev - wp) / rate
+            _add(select_oc_gas(prev, oc_gases).label(), prev, wp, seg_t)
+            prev = wp
+
+    # OC time at depth before ascending (bail_extra)
+    if bail_extra > 0.0 and bottom_d > 0.0 and oc_gases:
+        _add(select_oc_gas(bottom_d, oc_gases).label(), bottom_d, bottom_d, bail_extra)
+
+    if not stops:
+        return litres
+
+    # Transit from bottom to first deco stop (ascent rate, split at switch depths)
+    _transit(bottom_d, stops[0].depth, asc_rate)
+
+    # Each deco stop + inter-stop transit
+    for i, s in enumerate(stops):
+        _add(s.gas, s.depth, s.depth, s.time)
+        if i + 1 < len(stops):
+            _transit(s.depth, stops[i + 1].depth, deco_rate)
+
+    # Final ascent from last stop to surface
+    _transit(stops[-1].depth, 0.0, deco_rate)
+
+    return litres
+
+
+def _gas_litres_per_idx(
+    result:     DiveResult,
+    oc_gases:   List[OCGas],
+    sac:        float,
+    bail_extra: float = 0.0,
+    bottom_d:   float = 0.0,
+    asc_rate:   float = 9.0,
+    deco_rate:  float = 3.0,
+) -> List[float]:
+    """
+    Like _gas_litres_per_gas but returns a list[float] indexed by gas position,
+    avoiding label-collision when two cylinders happen to share the same mix.
+
+    Attribution is by switch_depth, not by gas label, so two cylinders with
+    identical O2/He fractions are still correctly distinguished.
+
+    Returns: [litres_gas0, litres_gas1, ..., litres_gasN]
+    """
+    n = len(oc_gases)
+    litres: List[float] = [0.0] * n
+    stops = result.stops
+
+    def _idx_at(depth: float) -> int:
+        qualifying = [(i, g) for i, g in enumerate(oc_gases)
+                      if g.switch_depth >= depth]
+        if qualifying:
+            return min(qualifying, key=lambda x: x[1].switch_depth)[0]
+        return max(range(n), key=lambda i: oc_gases[i].switch_depth)
+
+    def _add(gas_idx: int, d_from: float, d_to: float, t_min: float) -> None:
+        if t_min <= 0 or not (0 <= gas_idx < n):
+            return
+        avg_d = (d_from + d_to) / 2.0
+        litres[gas_idx] += sac * t_min * (avg_d / 10.0 + 1.0)
+
+    def _transit(d_from: float, d_to: float, rate: float) -> None:
+        if d_from <= d_to or not oc_gases:
+            return
+        waypoints = _oc_ascent_waypoints(d_from, d_to, oc_gases)
+        prev = d_from
+        for wp in waypoints:
+            seg_t = (prev - wp) / rate
+            _add(_idx_at(prev), prev, wp, seg_t)
+            prev = wp
+
+    if bail_extra > 0.0 and bottom_d > 0.0 and oc_gases:
+        _add(_idx_at(bottom_d), bottom_d, bottom_d, bail_extra)
+
+    if not stops:
+        return litres
+
+    _transit(bottom_d, stops[0].depth, asc_rate)
+
+    for i, s in enumerate(stops):
+        _add(_idx_at(s.depth), s.depth, s.depth, s.time)
+        if i + 1 < len(stops):
+            _transit(s.depth, stops[i + 1].depth, deco_rate)
+
+    _transit(stops[-1].depth, 0.0, deco_rate)
+    return litres
+
+
+def generate_gas_combinations(
+    gas_rows:        List[OCGas],
+    selected_indices: List[int],
+    po2_limits:      dict,
+    o2_step:         int,
+    he_step:         int,
+    max_delta_pn2:   float,
+    max_end_m:       float = 999.0,
+) -> tuple:
+    """
+    Generate all (o2, he) combinations for selected cylinders and filter
+    by PO2 limits, END limit, and ΔPN2 at gas switches.
+
+    Arguments:
+        gas_rows         -- all OCGas objects in the dive (fixed switch depths)
+        selected_indices -- indices into gas_rows to optimise
+        po2_limits       -- {idx: (min_po2, max_po2)} for selected gases
+        o2_step          -- O2 grid spacing in percent (e.g. 5)
+        he_step          -- He grid spacing in percent (e.g. 5)
+        max_delta_pn2    -- maximum allowed PN2 increase at a gas switch [bar]
+        max_end_m        -- maximum Equivalent Narcotic Depth [m] at switch depth
+                           END = (switch_depth + 10) * (1 - fhe) - 10
+                           Default 999 = no END constraint.
+
+    Returns:
+        (valid_combinations, stats)
+
+        valid_combinations -- list of dicts {gas_idx: (o2_frac, he_frac)}
+                              only optimised indices present; non-optimised
+                              gases keep their original fractions at plan time.
+        stats -- {
+            "total_generated": int,    # cartesian product size (after all pre-filters)
+            "rejected_po2": int,       # per-gas pairs removed by PO2 check
+            "rejected_end": int,       # per-gas pairs removed by END check
+            "rejected_delta_pn2": int, # combinations removed by ΔPN2 check
+            "valid": int,
+            "limit_exceeded": bool,    # True if valid count exceeded 100 000
+        }
+    """
+    from itertools import product as _iproduct
+
+    stats = {
+        "total_generated":    0,
+        "rejected_po2":       0,
+        "rejected_end":       0,
+        "rejected_delta_pn2": 0,
+        "valid":              0,
+        "limit_exceeded":     False,
+    }
+
+    if not selected_indices or not gas_rows:
+        return [], stats
+
+    # ── Step 1: per-gas candidate lists (filtered by PO2) ─────────────────────
+    per_gas: dict = {}   # {idx: [(o2_frac, he_frac), ...]}
+
+    for idx in selected_indices:
+        gas       = gas_rows[idx]
+        sw_depth  = gas.switch_depth
+        p_amb     = P_SURF + sw_depth * WATER_DENSITY / 10.0
+        min_po2, max_po2 = po2_limits.get(idx, (0.18, 1.60))
+        candidates: List[tuple] = []
+
+        # O2 grid: dynamic start derived from min_po2 and switch_depth.
+        # Align upward to the nearest o2_step so the first candidate
+        # already satisfies PO2 >= min_po2.
+        import math as _math
+        _min_o2_frac = min_po2 / p_amb          # smallest breathable O2 fraction
+        _min_o2_raw  = _min_o2_frac * 100.0     # convert to percent
+        _min_o2_pct  = int(_math.ceil(_min_o2_raw / o2_step)) * o2_step
+        _min_o2_pct  = max(1, min(100, _min_o2_pct))   # clamp to [1, 100]
+
+        o2_values = list(range(_min_o2_pct, 100, o2_step)) + [100]
+        seen_o2: set = set()
+        for o2_pct in o2_values:
+            o2_pct = max(_min_o2_pct, min(100, o2_pct))
+            if o2_pct in seen_o2:
+                continue
+            seen_o2.add(o2_pct)
+
+            # He grid: 0 → (100 - o2_pct), always include both endpoints
+            he_max    = 100 - o2_pct
+            he_values = list(range(0, he_max, he_step)) + [he_max]
+            seen_he: set = set()
+            for he_pct in he_values:
+                he_pct = max(0, min(he_max, he_pct))
+                if he_pct in seen_he:
+                    continue
+                seen_he.add(he_pct)
+
+                o2_frac = o2_pct / 100.0
+                he_frac = he_pct / 100.0
+                po2     = o2_frac * p_amb
+
+                if not (min_po2 <= po2 <= max_po2):
+                    stats["rejected_po2"] += 1
+                    continue
+                # END check: (switch_depth + 10) * (1 - fhe) - 10
+                # O2 and N2 treated equally narcotic (standard tek convention)
+                end_m = (sw_depth + 10.0) * (1.0 - he_frac) - 10.0
+                if end_m > max_end_m:
+                    stats["rejected_end"] += 1
+                    continue
+                candidates.append((o2_frac, he_frac))
+
+        per_gas[idx] = candidates
+
+    # ── Step 2: cartesian product + ΔPN2 filter ───────────────────────────────
+    indices_order   = list(selected_indices)
+    candidate_lists = [per_gas[idx] for idx in indices_order]
+
+    # Product size (for stats) — avoid materialising if enormous
+    product_size = 1
+    for lst in candidate_lists:
+        product_size *= len(lst)
+    stats["total_generated"] = product_size
+
+    valid_combinations: List[dict] = []
+
+    # Pre-build non-optimised gas entries (switch_depth, o2, he) once
+    non_opt = {
+        i: (gas_rows[i].switch_depth, gas_rows[i].o2, gas_rows[i].he)
+        for i in range(len(gas_rows)) if i not in selected_indices
+    }
+
+    for combo in _iproduct(*candidate_lists):
+        # Optimised gases for this combination
+        opt_map = {indices_order[k]: combo[k] for k in range(len(indices_order))}
+
+        # Full sorted gas list: (switch_depth, o2_frac, he_frac)
+        full: List[tuple] = []
+        for i in range(len(gas_rows)):
+            sw = gas_rows[i].switch_depth
+            if i in opt_map:
+                o2f, hef = opt_map[i]
+            else:
+                _, o2f, hef = non_opt[i]
+            full.append((sw, o2f, hef))
+
+        # Sort deepest first
+        full_sorted = sorted(full, key=lambda x: x[0], reverse=True)
+
+        # ΔPN2 check at each switch point (transition to shallower gas)
+        rejected = False
+        for j in range(len(full_sorted) - 1):
+            _sw_deep, o2_deep, he_deep     = full_sorted[j]
+            sw_shallow, o2_shallow, he_shallow = full_sorted[j + 1]
+
+            p_amb_sw  = P_SURF + sw_shallow * WATER_DENSITY / 10.0
+            p_dry     = max(0.0, p_amb_sw - PH2O)
+            pn2_before = (1.0 - o2_deep    - he_deep)    * p_dry
+            pn2_after  = (1.0 - o2_shallow - he_shallow) * p_dry
+            delta_pn2  = pn2_after - pn2_before
+
+            if delta_pn2 > max_delta_pn2:
+                rejected = True
+                break
+
+        if rejected:
+            stats["rejected_delta_pn2"] += 1
+        else:
+            valid_combinations.append(opt_map)
+            stats["valid"] += 1
+            if stats["valid"] > 100_000:
+                stats["limit_exceeded"] = True
+                return [], stats
+
+    return valid_combinations, stats
+
+
 # ── Self-test ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys

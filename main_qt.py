@@ -2017,6 +2017,11 @@ class MainWindow(QMainWindow):
         db_tab = DatabasesTab(self._db, on_db_change=bp_tab.refresh_db)
         scroll.setWidget(db_tab)
         self._tabs.addTab(scroll, "  Databases  ")
+
+        # ── Optimal bailout tab (top-level, full window) ──────────────────────
+        opt_bail_w = dp_tab._build_optimal_bailout()
+        self._tabs.addTab(opt_bail_w, "  Optimal bailout  ")
+
         self._tabs.setCurrentIndex(3)   # show Databases first
 
 

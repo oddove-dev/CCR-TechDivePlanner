@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QScrollArea, QFrame, QGroupBox, QSizePolicy, QSplitter,
     QListWidget, QAbstractItemView, QCheckBox, QComboBox, QSpacerItem, QTabWidget,
     QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
+    QDoubleSpinBox, QSpinBox, QProgressBar, QDialog,
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
@@ -26,6 +27,7 @@ from buhlmann import (
     _PN2_SURF, PH2O,
     select_oc_gas, _oc_ascent_waypoints,
     TISSUES, P_SURF, WATER_DENSITY,
+    _gas_litres_per_gas, _gas_litres_per_idx, generate_gas_combinations,
 )
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -362,6 +364,210 @@ class _SimWorker(QThread):
             if seg_depth >= _max_d:
                 ccr_bottom_rt = cur_rt
         return ccr_bottom_rt
+
+
+# ── Optimal-bailout optimisation worker ──────────────────────────────────────
+
+class _OptWorker(QThread):
+    """Iterates valid gas combinations and runs simulate_bailout_from_bottom."""
+    progress = pyqtSignal(int, int)   # (current, total)
+    done     = pyqtSignal(list)       # list of result dicts
+
+    def __init__(self, combos, oc_gases, selected_indices, p, sac, parent=None):
+        super().__init__(parent)
+        self._combos           = combos          # [{gas_idx: (o2,he)}, ...]
+        self._oc_gases         = oc_gases        # List[OCGas] (original fractions)
+        self._selected         = set(selected_indices)
+        self._p                = p               # cached sim params dict
+        self._sac              = sac
+        self._cancelled        = False
+
+    @staticmethod
+    def simulate_combo(combo, oc_gases, p):
+        """Run simulate_bailout_from_bottom for a single gas combination.
+
+        Returns (DiveResult, new_gases).  Shared by the optimisation loop and
+        the Top-N detail-table click handler, so a row's expanded stop list is
+        guaranteed identical to the plan that produced its summary numbers.
+        """
+        # bail_segs: bail_extra subtracted from the deepest segment
+        _be  = p.get("bail_extra", 0.0)
+        segs = list(p["segments"])
+        if _be > 0.0 and segs:
+            _max_d = max((d for d, _ in segs), default=0.0)
+            for bi in range(len(segs) - 1, -1, -1):
+                if segs[bi][0] >= _max_d:
+                    d_, t_ = segs[bi]
+                    segs[bi] = (d_, max(0.0, t_ - _be))
+                    break
+
+        # Candidate gas list — swap only the selected indices
+        new_gases = []
+        for i, gas in enumerate(oc_gases):
+            if i in combo:
+                o2f, hef = combo[i]
+                new_gases.append(OCGas(o2=o2f, he=hef,
+                                       switch_depth=gas.switch_depth))
+            else:
+                new_gases.append(gas)
+
+        result = simulate_bailout_from_bottom(
+            segments      = segs,
+            ccr           = p.get("ccr"),
+            oc_gases      = new_gases,
+            gf_low        = p.get("bo_gf_lo", 0.55),
+            gf_high       = p.get("bo_gf_hi", 0.70),
+            desc_rate     = p.get("desc_r",   20.0),
+            asc_rate      = p.get("asc_r",     9.0),
+            deco_rate     = p.get("deco_r",    3.0),
+            snap_interval = 9999.0,   # no tissue snapshots needed
+            stop_interval = p.get("stop_iv", 3.0),
+            bail_extra    = _be,
+            last_stop     = p.get("bo_last_stop", 3.0),
+        )
+        return result, new_gases
+
+    @staticmethod
+    def build_result(combo, oc_gases, p, sac):
+        """Simulate one combination and assemble its summary result dict.
+
+        Shared by the optimisation loop and the "Add current plan as Rank 0"
+        button, so a manually-added reference row carries exactly the same
+        fields (and is computed the same way) as optimiser candidates.
+        """
+        _be      = p.get("bail_extra", 0.0)
+        bottom_d = max((d for d, _ in p["segments"]), default=0.0)
+
+        result, new_gases = _OptWorker.simulate_combo(combo, oc_gases, p)
+        litres = _gas_litres_per_gas(
+            result    = result,    oc_gases  = new_gases, sac      = sac,
+            bail_extra = _be,      bottom_d  = bottom_d,
+            asc_rate  = p.get("asc_r", 9.0), deco_rate = p.get("deco_r", 3.0),
+        )
+        bail_label = new_gases[0].label()
+        bailout_L  = litres.get(bail_label, 0.0)
+        deco_L     = sum(L for lbl, L in litres.items() if lbl != bail_label)
+        # Per-cylinder litres by INDEX (avoids label collision)
+        litres_per_idx = _gas_litres_per_idx(
+            result    = result,    oc_gases  = new_gases, sac      = sac,
+            bail_extra = _be,      bottom_d  = bottom_d,
+            asc_rate  = p.get("asc_r", 9.0), deco_rate = p.get("deco_r", 3.0),
+        )
+        return {
+            "combination":    combo,
+            "tts":            result.tts,
+            "deco_time":      sum(s.time for s in result.stops),
+            "gas_litres":     litres,
+            "litres_per_idx": litres_per_idx,
+            "bailout_L":      bailout_L,
+            "deco_L":         deco_L,
+            "total_L":        bailout_L + deco_L,
+        }
+
+    def run(self):
+        combos   = self._combos
+        total    = len(combos)
+        results  = []
+
+        for idx, combo in enumerate(combos):
+            if self._cancelled:
+                break
+            try:
+                results.append(
+                    self.build_result(combo, self._oc_gases, self._p, self._sac))
+            except Exception:
+                pass   # skip invalid/error combinations
+
+            if (idx + 1) % 50 == 0 or idx == total - 1:
+                self.progress.emit(idx + 1, total)
+
+        self.done.emit(results if not self._cancelled else [])
+
+
+# ── Bailout-plan pop-up window ────────────────────────────────────────────────
+
+class _BailoutPlanWindow(QDialog):
+    """Non-modal pop-up showing the full bailout plan for a selected optimiser
+    combination.  A single instance is reused — populate() refreshes its title,
+    summary header and table for each new selection.  ESC / Close hides it.
+    """
+
+    _HEADERS = ["Depth / Label", "Stop", "Runtime", "Gas", "PO₂[bar]",
+                "Press[bar]", "Used[bar]", "Buoyancy[kg]", "m/drop[kg]"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Bailout plan")
+        self.setModal(False)
+        self.setMinimumSize(900, 600)
+
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(8, 8, 8, 8)
+
+        self.summary_lbl = QLabel("—")
+        self.summary_lbl.setStyleSheet("font-weight:bold; font-size:11px;")
+        vl.addWidget(self.summary_lbl)
+
+        self.tbl = QTableWidget(0, len(self._HEADERS))
+        self.tbl.setHorizontalHeaderLabels(self._HEADERS)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        # Explain why the cylinder/buoyancy columns are blank in the optimiser:
+        # they depend on the configured cylinders, which the optimiser abstracts.
+        _na_tip = ("Not modelled by the optimiser — it works with abstract gas "
+                   "mixes, not the configured cylinders' volumes/pressures. "
+                   "See the main planner's Bailout plan tab for these values.")
+        for _c in (5, 6, 7, 8):   # Press / Used / Buoyancy / m/drop
+            _hi = self.tbl.horizontalHeaderItem(_c)
+            if _hi is not None:
+                _hi.setToolTip(_na_tip)
+        vl.addWidget(self.tbl, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_row.addWidget(close_btn)
+        vl.addLayout(btn_row)
+
+    def populate(self, title, summary, rows):
+        """Refresh the window for a new combination.
+
+        PO₂ uses the main planner's formula, (depth/10 + 1) × fO₂.  The
+        cylinder-dependent columns (Press/Used/Buoyancy/m/drop) are not
+        modelled by the optimiser and are shown as "—".
+        """
+        self.setWindowTitle(title)
+        self.summary_lbl.setText(summary)
+
+        tbl  = self.tbl
+        DASH = "—"
+        tbl.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            gas = row["gas_obj"]
+            if gas is not None:
+                o2i     = round(gas.o2 * 100)
+                po2     = (row["depth"] / 10.0 + 1.0) * o2i / 100.0
+                gas_lbl = gas.label()
+                po2_str = f"{po2:.2f}"
+            else:
+                gas_lbl = po2_str = ""
+
+            stop_str = (f"{row['stop']:.0f}"
+                        if row["show_stop"] and row["stop"] is not None else "")
+            rt       = row["runtime"]
+            rt_str   = "" if rt is None else f"{rt:.0f}"
+
+            cells = [row["label"], stop_str, rt_str, gas_lbl, po2_str,
+                     DASH, DASH, DASH, DASH]
+            for c, txt in enumerate(cells):
+                item  = QTableWidgetItem(txt)
+                align = (Qt.AlignmentFlag.AlignLeft if c in (0, 3)
+                         else Qt.AlignmentFlag.AlignCenter)
+                item.setTextAlignment(align | Qt.AlignmentFlag.AlignVCenter)
+                tbl.setItem(r, c, item)
 
 
 # ── DivePlannerTab ────────────────────────────────────────────────────────────
@@ -3138,6 +3344,910 @@ class DivePlannerTab(QWidget):
                     "real_gas_L": rg, "pressure": pres}
         return None
 
+    # ── Optimal bailout tab ───────────────────────────────────────────────────
+
+    _OPT_ROLES = {0: "Bailout gas", 1: "Interstage gas",
+                  2: "Deco gas 1",  3: "Deco gas 2"}
+    _OPT_OBJECTIVES = ["Bailout gas usage [L]",
+                       "Total deco time [min]",
+                       "Total gas usage [L]"]
+
+    def _build_optimal_bailout(self):
+        """Build the 'Optimal bailout' tab skeleton (Phase 3 — no computation yet)."""
+        _GRP_STYLE = (
+            "QGroupBox { font-weight: bold; padding-top: 14px; margin-top: 4px; "
+            "border: 1px solid #bbbbbb; border-radius: 3px; } "
+            "QGroupBox::title { subcontrol-origin: margin; "
+            "subcontrol-position: top left; left: 6px; padding: 0 2px; }"
+        )
+        w  = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(4, 4, 4, 4)
+        vl.setSpacing(3)
+
+        # ── Section 1: Parameters (3 columns) ─────────────────────────────
+        param_w  = QWidget()
+        param_hl = QHBoxLayout(param_w)
+        param_hl.setContentsMargins(0, 0, 0, 0)
+        param_hl.setSpacing(6)
+
+        # Column A — cylinders to optimise
+        grp_a = QGroupBox("Cylinders to optimise")
+        grp_a.setStyleSheet(_GRP_STYLE)
+        self._opt_col_a_vl = QVBoxLayout(grp_a)
+        self._opt_col_a_vl.setContentsMargins(6, 4, 6, 4)
+        self._opt_col_a_vl.setSpacing(3)
+
+        # Column B — PO2 limits per cylinder
+        grp_b = QGroupBox("PO₂ limits per cylinder")
+        grp_b.setStyleSheet(_GRP_STYLE)
+        grp_b.setMinimumWidth(380)
+        self._opt_col_b_vl = QVBoxLayout(grp_b)
+        self._opt_col_b_vl.setContentsMargins(6, 4, 6, 4)
+        self._opt_col_b_vl.setSpacing(3)
+
+        # Column C — iteration settings
+        grp_c = QGroupBox("Iteration settings")
+        grp_c.setStyleSheet(_GRP_STYLE)
+        grp_c.setMinimumWidth(320)
+        vl_c  = QGridLayout(grp_c)
+        vl_c.setContentsMargins(6, 4, 6, 4)
+        vl_c.setHorizontalSpacing(6)
+        vl_c.setVerticalSpacing(4)
+
+        def _sb(lo, hi, val, dec=0, step=1):
+            if dec == 0:
+                sb = QSpinBox()
+                sb.setRange(int(lo), int(hi))
+                sb.setValue(int(val))
+            else:
+                sb = QDoubleSpinBox()
+                sb.setRange(lo, hi)
+                sb.setDecimals(dec)
+                sb.setSingleStep(step)
+                sb.setValue(val)
+            sb.setMinimumWidth(75)
+            sb.setStyleSheet(f"background:{CLR_INPUT};")
+            return sb
+
+        self._opt_o2_step    = _sb(1, 20, 5)
+        self._opt_he_step    = _sb(1, 20, 5)
+        self._opt_max_dpn2   = _sb(0.1, 1.0, 0.5, dec=2, step=0.05)
+        self._opt_max_end    = _sb(10, 99, 25)
+
+        _end_lbl = QLabel("Max END [m]:")
+        _end_lbl.setToolTip(
+            "Equivalent Narcotic Depth limit. Maximum narcotic depth the gas may "
+            "give at its switch depth.\nEND = (depth + 10) × (1 − fHe) − 10\n"
+            "Lower value = more helium required in deep mixes.")
+        self._opt_max_end.setToolTip(_end_lbl.toolTip())
+
+        for r, (lbl, widget) in enumerate([
+            ("O₂ step [%]:",    self._opt_o2_step),
+            ("He step [%]:",    self._opt_he_step),
+            ("Max ΔPN₂ [bar]:", self._opt_max_dpn2),
+            ("Max END [m]:",    self._opt_max_end),
+        ]):
+            _lw = QLabel(lbl) if lbl != "Max END [m]:" else _end_lbl
+            vl_c.addWidget(_lw,    r, 0, Qt.AlignmentFlag.AlignLeft)
+            vl_c.addWidget(widget, r, 1, Qt.AlignmentFlag.AlignLeft)
+
+        self._opt_primary_sort   = QComboBox()
+        self._opt_secondary_sort = QComboBox()
+        for cb in (self._opt_primary_sort, self._opt_secondary_sort):
+            cb.addItems(self._OPT_OBJECTIVES)
+        self._opt_secondary_sort.setCurrentIndex(1)   # default: deco time
+
+        vl_c.addWidget(QLabel("Primary sort:"),    4, 0, Qt.AlignmentFlag.AlignLeft)
+        vl_c.addWidget(self._opt_primary_sort,     4, 1)
+        vl_c.addWidget(QLabel("Secondary sort:"),  5, 0, Qt.AlignmentFlag.AlignLeft)
+        vl_c.addWidget(self._opt_secondary_sort,   5, 1)
+        vl_c.setRowStretch(6, 1)
+
+        param_hl.addWidget(grp_a, stretch=1)
+        param_hl.addWidget(grp_b, stretch=2)
+        param_hl.addWidget(grp_c, stretch=1)
+        vl.addWidget(param_w)
+
+        # ── Run / Cancel / Progress ────────────────────────────────────────
+        ctrl_w  = QWidget()
+        ctrl_hl = QHBoxLayout(ctrl_w)
+        ctrl_hl.setContentsMargins(0, 2, 0, 2)
+        ctrl_hl.setSpacing(6)
+
+        self._opt_run_btn = QPushButton("Run optimization ▶")
+        self._opt_run_btn.setStyleSheet(
+            "background:#44aa44; color:white; font-weight:bold; padding:3px 14px;")
+        self._opt_run_btn.clicked.connect(self._opt_run_pressed)
+
+        self._opt_cancel_btn = QPushButton("Cancel")
+        self._opt_cancel_btn.setEnabled(False)
+        self._opt_cancel_btn.setStyleSheet("padding:3px 8px;")
+        self._opt_cancel_btn.clicked.connect(self._opt_cancel)
+
+        self._opt_add_plan_btn = QPushButton("Add current plan as Rank 0")
+        self._opt_add_plan_btn.setStyleSheet(
+            "background:#fff3c4; padding:3px 12px;")
+        self._opt_add_plan_btn.clicked.connect(self._opt_add_current_plan)
+
+        self._opt_progress = QProgressBar()
+        self._opt_progress.setRange(0, 100)
+        self._opt_progress.setValue(0)
+        self._opt_progress.setFixedHeight(14)
+        self._opt_progress.setVisible(False)
+
+        self._opt_status_lbl = QLabel("Ready")
+        self._opt_status_lbl.setStyleSheet("font-style:italic; color:#555555;")
+
+        ctrl_hl.addWidget(self._opt_run_btn)
+        ctrl_hl.addWidget(self._opt_cancel_btn)
+        ctrl_hl.addWidget(self._opt_add_plan_btn)
+        ctrl_hl.addWidget(self._opt_progress, stretch=1)
+        ctrl_hl.addWidget(self._opt_status_lbl)
+        ctrl_hl.addStretch()
+        vl.addWidget(ctrl_w)
+
+        # ── Dive context label (above results) ─────────────────────────────
+        self._opt_context_lbl = QLabel("No plan loaded — run a dive plan first.")
+        self._opt_context_lbl.setStyleSheet(
+            "font-size:10px; color:#334455; background:#e8f0f8; "
+            "border:1px solid #bbccdd; padding:3px 8px; border-radius:3px;")
+        self._opt_context_lbl.setWordWrap(True)
+        vl.addWidget(self._opt_context_lbl)
+
+        # ── Section 2: Results (Pareto plot | Top-N table) ─────────────────
+        mid_split = QSplitter(Qt.Orientation.Horizontal)
+
+        # Pareto placeholder
+        self._opt_pareto_fig    = _Figure(figsize=(6, 4), facecolor="#1a1a2e")
+        self._opt_pareto_canvas = _FigCanvas(self._opt_pareto_fig)
+        _ax = self._opt_pareto_fig.add_subplot(111)
+        _ax.set_facecolor("#0d1525")
+        _ax.set_title("Pareto front", color="#aaddff", fontsize=9)
+        _ax.set_xlabel("Bailout gas usage [L]", color="#aaddff", fontsize=8)
+        _ax.set_ylabel("Total deco time [min]", color="#aaddff", fontsize=8)
+        _ax.tick_params(colors="#7799aa", labelsize=7)
+        _ax.text(0.5, 0.5, "Run optimisation to see results",
+                 ha="center", va="center", transform=_ax.transAxes,
+                 color="#556677", fontsize=8, style="italic")
+        for sp in _ax.spines.values():
+            sp.set_edgecolor("#334455")
+        self._opt_pareto_fig.tight_layout()
+        self._opt_pareto_canvas.draw()
+        self._opt_pareto_canvas.mpl_connect(
+            "button_press_event", self._opt_on_plot_click)
+
+        pareto_w = QWidget()
+        QVBoxLayout(pareto_w).addWidget(self._opt_pareto_canvas)
+        pareto_w.layout().setContentsMargins(0, 0, 0, 0)
+        mid_split.addWidget(pareto_w)
+
+        # Top-N table
+        self._opt_result_tbl = QTableWidget(0, 7)
+        self._opt_result_tbl.setHorizontalHeaderLabels(
+            ["Rank", "Bailout", "Deco 1", "Deco 2", "BO gas [L]", "Deco [min]", "Pareto"])
+        self._opt_result_tbl.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._opt_result_tbl.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._opt_result_tbl.setAlternatingRowColors(True)
+        _rhh = self._opt_result_tbl.horizontalHeader()
+        _rhh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._opt_result_tbl.verticalHeader().setVisible(False)
+        self._opt_result_tbl.setStyleSheet(
+            "font-size:9px;"
+            "QTableWidget::item:selected{background:#bcd8f0; color:#000000;}")
+        self._opt_result_tbl.itemSelectionChanged.connect(
+            self._opt_on_result_selected)
+        mid_split.addWidget(self._opt_result_tbl)
+        mid_split.setSizes([450, 450])
+        vl.addWidget(mid_split, stretch=3)
+
+        # The per-combination stop detail opens in a separate pop-up window
+        # (_BailoutPlanWindow), created lazily on the first Rank/row/plot click.
+        self._opt_plan_window = None
+
+        # Optional "Rank 0" reference row (current plan added manually); a dict
+        # {combination, oc_gases, selected, result} or None.  Persists across
+        # optimisation runs and is always rendered at the top of the Top-N table.
+        self._opt_rank0 = None
+
+        # Populate column A and B from current gas rows
+        self._opt_gas_checks  = []
+        self._opt_po2_rows    = []
+        self._opt_refresh_gases()
+
+        return w
+
+    def _opt_refresh_gases(self):
+        """Rebuild columns A and B to match current _gas_rows."""
+        # Clear old widgets
+        for layout in (self._opt_col_a_vl, self._opt_col_b_vl):
+            while layout.count():
+                item = layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+        self._opt_gas_checks = []
+        self._opt_po2_rows   = []
+
+        for i, row in enumerate(self._gas_rows):
+            role       = self._OPT_ROLES.get(i, f"Gas {i+1}")
+            is_bailout = row.get("_is_bailout", i == 0)
+            # row["o2"]/["he"] are already integer percent — no scaling
+            o2i = int(row.get("o2", 0))
+            hei = int(row.get("he", 0))
+            mix = f" ({o2i}/{hei})" if o2i > 0 else ""
+
+            # Column A — checkbox
+            cb = QCheckBox(f"{role}{mix}")
+            cb.setChecked(True)
+            self._opt_col_a_vl.addWidget(cb)
+            self._opt_gas_checks.append(cb)
+
+            # Column B — min/max PO2 row
+            po2_row = QWidget()
+            po2_hl  = QHBoxLayout(po2_row)
+            po2_hl.setContentsMargins(0, 0, 0, 0)
+            po2_hl.setSpacing(4)
+
+            lbl = QLabel(f"{role}:")
+            lbl.setMinimumWidth(90)
+            po2_hl.addWidget(lbl)
+
+            def _dsb(lo, hi, val):
+                sb = QDoubleSpinBox()
+                sb.setRange(lo, hi)
+                sb.setDecimals(2)
+                sb.setSingleStep(0.05)
+                sb.setValue(val)
+                sb.setMinimumWidth(75)
+                sb.setStyleSheet(f"background:{CLR_INPUT};")
+                return sb
+
+            min_sb = _dsb(0.10, 0.30, 0.18)
+            max_sb = _dsb(0.50, 2.00, 1.80 if is_bailout else 1.60)
+
+            lbl_min = QLabel("Min")
+            lbl_min.setContentsMargins(0, 0, 8, 0)
+            lbl_max = QLabel("Max")
+            lbl_max.setContentsMargins(0, 0, 8, 0)
+            po2_hl.addWidget(lbl_min)
+            po2_hl.addWidget(min_sb)
+            po2_hl.addWidget(lbl_max)
+            po2_hl.addWidget(max_sb)
+            po2_hl.addStretch()
+
+            self._opt_col_b_vl.addWidget(po2_row)
+            self._opt_po2_rows.append((min_sb, max_sb))
+
+        self._opt_col_a_vl.addStretch()
+        self._opt_col_b_vl.addStretch()
+
+    def _opt_on_rank_clicked(self, rank: int):
+        """Rank-button handler — open the detail table for an explicit row.
+
+        The Rank cell is a QPushButton (setCellWidget); a click is consumed by
+        the button, so the row is never auto-selected and selectRow() alone does
+        not update currentRow().  We therefore pass the rank index directly and
+        select the row for the visual highlight.
+        """
+        tbl = self._opt_result_tbl
+        tbl.blockSignals(True)          # avoid a redundant selection-driven call
+        tbl.selectRow(rank)
+        tbl.setCurrentCell(rank, 1)     # keep currentRow() consistent
+        tbl.blockSignals(False)
+        self._opt_show_detail_for_row(rank)
+
+    def _opt_on_result_selected(self):
+        """Manual row-selection handler — open the detail table for currentRow."""
+        self._opt_show_detail_for_row(self._opt_result_tbl.currentRow())
+
+    def _opt_show_detail_for_row(self, row: int):
+        """Open (or refresh) the bailout-plan pop-up for Top-N row `row`.
+
+        Re-runs simulate_bailout_from_bottom for that combination (one extra,
+        cheap simulation) via _OptWorker.simulate_combo, so the plan shown is
+        identical to the optimisation run — and to the main planner's Bailout
+        plan for the same gas configuration.  A single pop-up window is reused
+        across selections.
+        """
+        p = getattr(self, "_opt_cached_params", None)
+        if p is None or row < 0:
+            return
+
+        # Row 0 is the Rank 0 reference (if present); optimiser rows are below it.
+        rank0 = getattr(self, "_opt_rank0", None)
+        off   = 1 if rank0 else 0
+
+        if rank0 and row == 0:
+            combo    = rank0["combination"]
+            oc_gases = rank0["oc_gases"]
+            sel      = rank0["selected"]
+            rank_txt = "0"
+        else:
+            results    = getattr(self, "_opt_results_data", None)
+            sorted_idx = getattr(self, "_opt_results_sorted_idx", None)
+            oc_gases   = getattr(self, "_opt_last_oc_gases", None)
+            opt_i      = row - off
+            if (not results or not sorted_idx or not oc_gases
+                    or opt_i < 0 or opt_i >= len(sorted_idx)):
+                return
+            combo    = results[sorted_idx[opt_i]]["combination"]
+            sel      = getattr(self, "_opt_selected", [])
+            rank_txt = str(opt_i + 1)
+
+        try:
+            result, new_gases = _OptWorker.simulate_combo(combo, oc_gases, p)
+        except Exception:
+            return
+
+        # Runtime offset onto the real dive timeline — identical to the main
+        # planner (_do_run): the bailout sim's internal runtime already includes
+        # bail_extra (cut-bottom + bail_extra OC), so the offset uses the sum of
+        # the ORIGINAL (uncut) segments — NOT the cut sum (that would add
+        # bail_extra a second time).
+        ccr_bottom_rt = _SimWorker._ccr_bottom_rt(p)
+        be   = p.get("bail_extra", 0.0)
+        rt_offset = ccr_bottom_rt - sum(t for _, t in p["segments"])
+
+        # Summary header — same format as the main planner's Bailout plan
+        summary = (
+            f"Bailout at: {ccr_bottom_rt - be:.0f} min  |  "
+            f"TTS: {result.tts:.0f} min  |  "
+            f"Runtime: {result.runtime + rt_offset:.0f} min  |  "
+            f"OTU: {result.otu:.0f}  |  CNS: {result.cns:.1f} %"
+        )
+
+        # Window title — Rank + the gas mixes (e.g. "Bailout 15/50, Deco 1 …")
+        roles = ["Bailout", "Deco 1", "Deco 2"]
+        parts = []
+        for k, gi in enumerate(sel[:3]):
+            if gi in combo:
+                o2f, hef = combo[gi]
+                parts.append(f"{roles[k]} {int(round(o2f*100))}/{int(round(hef*100))}")
+        title = f"Bailout plan — Rank {rank_txt}"
+        if parts:
+            title += f" ({', '.join(parts)})"
+
+        rows = self._opt_build_detail_rows(result, new_gases, p,
+                                           ccr_bottom_rt, rt_offset)
+
+        if self._opt_plan_window is None:
+            self._opt_plan_window = _BailoutPlanWindow(self)
+        self._opt_plan_window.populate(title, summary, rows)
+        self._opt_plan_window.show()
+        self._opt_plan_window.raise_()
+        self._opt_plan_window.activateWindow()
+
+    def _opt_build_detail_rows(self, result, oc_gases, p,
+                               ccr_bottom_rt, rt_offset):
+        """Build the bailout-plan row sequence for the stop-detail table.
+
+        Mirrors the main planner's Bailout plan row structure and values:
+        surface → descent → bailout point → ascent waypoints (gas switches) →
+        deco stops → surface.  Nav rows carry an arrow label and a blank Stop;
+        deco rows carry their stop duration.  Runtime is cumulative (offset onto
+        the real dive timeline).  Each row carries the breathing-gas object (or
+        None) from which PO₂ is computed in _BailoutPlanWindow.populate.
+        """
+        segs   = p["segments"]
+        max_d  = max((d for d, _ in segs), default=0.0)
+        desc_r = p.get("desc_r", 20.0)
+        asc_r  = p.get("asc_r",   9.0)
+        be     = p.get("bail_extra", 0.0)
+        stops  = result.stops
+        rows   = []
+
+        def _row(label, depth, stop_t, runtime, gas_obj, show_stop=False):
+            rows.append({"label": label, "depth": depth, "stop": stop_t,
+                         "runtime": runtime, "gas_obj": gas_obj,
+                         "show_stop": show_stop})
+
+        # Surface start + descent to bailout depth (no OC gas yet — on the loop)
+        _row("@ 0m", 0.0, None, 0.0, None)
+        t_desc = max_d / desc_r if desc_r > 0 else 0.0
+        _row(f"↓0→{max_d:.0f}m", max_d, None, t_desc, None)
+
+        # Bailout point — switch to OC.  bail_extra > 0 means extra OC minutes
+        # at depth before ascending (matches _OptWorker.simulate_combo).
+        bail_gas = select_oc_gas(max_d, oc_gases) if oc_gases else None
+        plabel   = f"@ {max_d:.0f}m  +{be:.0f} min" if be > 0 else f"@ {max_d:.0f}m"
+        _row(plabel, max_d, None, ccr_bottom_rt - be, bail_gas)
+
+        # Ascent from bottom to the first stop — one row per gas-switch waypoint
+        first_stop_d = (result.first_stop_depth
+                        if result.first_stop_depth > 0 and stops
+                        else (stops[0].depth if stops else 0.0))
+        seg_rt = ccr_bottom_rt
+        if stops and oc_gases and max_d > first_stop_d:
+            seg_top = max_d
+            for seg_bot in _oc_ascent_waypoints(max_d, first_stop_d, oc_gases):
+                if seg_bot >= seg_top:
+                    continue
+                seg_time = (seg_top - seg_bot) / asc_r if asc_r > 0 else 0.0
+                seg_rt  += seg_time
+                _row(f"↑{seg_top:.0f}→{seg_bot:.0f}m", seg_top, None, seg_rt,
+                     select_oc_gas(seg_top, oc_gases))
+                seg_top = seg_bot
+
+        # Deco stops — real stops show their duration; runtime is offset
+        for s in stops:
+            gas_obj = select_oc_gas(s.depth, oc_gases) if oc_gases else None
+            _row(f"{s.depth:.0f} m", s.depth, s.time, s.runtime + rt_offset,
+                 gas_obj, show_stop=True)
+
+        # Surface
+        _row("↑ Surface", 0.0, None, result.runtime + rt_offset, None)
+        return rows
+
+    def _opt_run_pressed(self):
+        """Phase 4+5: generate combinations, start optimisation worker."""
+        from PyQt6.QtWidgets import QMessageBox
+
+        # Require a simulation to have been run first
+        p = getattr(self, "_opt_cached_params", None)
+        if p is None:
+            QMessageBox.information(self, "Optimal bailout",
+                "Run a dive plan first so the planner has valid parameters.")
+            return
+
+        # Read SAC
+        try:
+            sac = float(getattr(self, "_sac_le", None).text())
+        except Exception:
+            sac = 20.0
+
+        # Bottom depth from canonical sim params (never from the UI sentinel "999")
+        bottom_d = max((d for d, _ in p["segments"]), default=0.0)
+
+        # Update dive context label
+        _ccr_rt   = _SimWorker._ccr_bottom_rt(p)
+        _bail_ext = p.get("bail_extra", 0.0)
+        _bail_rt  = max(0.0, _ccr_rt - _bail_ext)
+        _ccr      = p.get("ccr")
+        if _ccr:
+            _dil_o2 = int(round(_ccr.diluent_o2 * 100))
+            _dil_he = int(round(_ccr.diluent_he * 100))
+            _dil    = f"Trimix {_dil_o2}/{_dil_he}" if _dil_he > 0 else f"Nitrox {_dil_o2}"
+        else:
+            _dil = "?"
+        _gf_lo  = int(round(p.get("gf_lo",  0.55) * 100))
+        _gf_hi  = int(round(p.get("gf_hi",  0.80) * 100))
+        _bt_max = sum(t for d, t in p["segments"] if d >= bottom_d)
+        self._opt_context_lbl.setText(
+            f"Simulating:  {bottom_d:.0f} m × {_bt_max:.0f} min  |  "
+            f"Diluent: {_dil}  |  GF: {_gf_lo}/{_gf_hi}  |  "
+            f"Bailout from: {_bail_rt:.0f} min @ {bottom_d:.0f} m"
+            + (f"  (+{_bail_ext:.0f} min OC at depth)" if _bail_ext > 0 else "")
+        )
+
+        # Build OCGas list from current UI gas rows
+        # Gas0 (bailout): switch_depth = bottom_d from sim params
+        # Others: sw_le.text() with sanity check; skip if invalid
+        oc_gases   = []
+        _skip_idxs = set()   # indices with no valid switch_depth
+        for i, row in enumerate(self._gas_rows):
+            if i == 0:
+                sw = bottom_d   # Alt A: authoritative source
+            else:
+                try:
+                    sw = float(row["sw_le"].text())
+                except (ValueError, AttributeError):
+                    sw = 0.0
+                if sw >= 990 or sw <= 0:
+                    print(f"  [opt] Gas{i}: switch_depth={sw!r} invalid — "
+                          f"excluded from optimisation")
+                    _skip_idxs.add(i)
+            # row["o2"]/["he"] are integer percent → OCGas wants fractions 0–1
+            oc_gases.append(OCGas(o2=row["o2"] / 100.0, he=row["he"] / 100.0,
+                                  switch_depth=sw))
+        print(f"  [opt] Switch depths used: "
+              + ", ".join(f"Gas{i}={g.switch_depth:.0f}m"
+                          for i, g in enumerate(oc_gases)))
+
+        # Remove gases with invalid switch_depth from the selected set
+        selected = [i for i, cb in enumerate(self._opt_gas_checks)
+                    if cb.isChecked() and i not in _skip_idxs]
+        if not selected:
+            self._opt_status_lbl.setText("No cylinders selected.")
+            return
+
+        po2_limits = {i: (mn.value(), mx.value())
+                      for i, (mn, mx) in enumerate(self._opt_po2_rows)}
+
+        # ── Clear stale results before any new run ────────────────────────
+        self._opt_result_tbl.clearContents()
+        self._opt_result_tbl.setRowCount(0)
+        # Close any stale bailout-plan pop-up — its combination is now invalid
+        if getattr(self, "_opt_plan_window", None) is not None:
+            self._opt_plan_window.close()
+        _fig = self._opt_pareto_fig
+        _fig.clear()
+        _ax = _fig.add_subplot(111)
+        _ax.set_facecolor("#0d1525")
+        _ax.set_title("Pareto front", color="#aaddff", fontsize=9)
+        _ax.set_xlabel("Bailout gas usage [L]", color="#aaddff", fontsize=8)
+        _ax.set_ylabel("Total deco time [min]",  color="#aaddff", fontsize=8)
+        _ax.tick_params(colors="#7799aa", labelsize=7)
+        for sp in _ax.spines.values():
+            sp.set_edgecolor("#334455")
+        _fig.tight_layout()
+        self._opt_pareto_canvas.draw()
+        self._opt_plot_results = []
+
+        self._opt_status_lbl.setText("Generating combinations…")
+
+        valid_combos, stats = generate_gas_combinations(
+            gas_rows         = oc_gases,
+            selected_indices = selected,
+            po2_limits       = po2_limits,
+            o2_step          = self._opt_o2_step.value(),
+            he_step          = self._opt_he_step.value(),
+            max_delta_pn2    = self._opt_max_dpn2.value(),
+            max_end_m        = float(self._opt_max_end.value()),
+        )
+
+        if stats["limit_exceeded"]:
+            QMessageBox.warning(self, "Optimal bailout",
+                "More than 100 000 valid combinations.\n"
+                "Use larger step sizes or tighter PO₂ limits.")
+            self._opt_status_lbl.setText("Limit exceeded — reduce search space.")
+            return
+
+        if not valid_combos:
+            self._opt_status_lbl.setText(
+                f"No valid combinations — "
+                f"PO₂ rej: {stats['rejected_po2']:,}, "
+                f"END rej: {stats['rejected_end']:,}, "
+                f"ΔPN₂ rej: {stats['rejected_delta_pn2']:,}.")
+            return
+
+        gen_msg = (f"Generated {stats['total_generated']:,} | "
+                   f"valid {stats['valid']:,} | "
+                   f"PO₂ rej {stats['rejected_po2']:,} | "
+                   f"END rej {stats['rejected_end']:,} | "
+                   f"ΔPN₂ rej {stats['rejected_delta_pn2']:,}")
+        print(f"\n=== Optimal bailout ===\n  {gen_msg}")
+
+        # Store for later phases
+        self._opt_last_combos   = valid_combos
+        self._opt_last_oc_gases = oc_gases
+        self._opt_selected      = selected
+        self._opt_last_stats    = stats
+
+        # UI state: running
+        self._opt_run_btn.setEnabled(False)
+        self._opt_cancel_btn.setEnabled(True)
+        self._opt_progress.setRange(0, len(valid_combos))
+        self._opt_progress.setValue(0)
+        self._opt_progress.setVisible(True)
+        self._opt_status_lbl.setText(f"Starting {len(valid_combos):,} simulations…")
+
+        # Start worker
+        self._opt_worker = _OptWorker(
+            combos          = valid_combos,
+            oc_gases        = oc_gases,
+            selected_indices= selected,
+            p               = p,
+            sac             = sac,
+        )
+        self._opt_worker.progress.connect(self._opt_on_progress)
+        self._opt_worker.done.connect(self._opt_on_done)
+        self._opt_worker.start()
+
+    def _opt_cancel(self):
+        w = getattr(self, "_opt_worker", None)
+        if w and w.isRunning():
+            w._cancelled = True
+            self._opt_status_lbl.setText("Cancelling…")
+
+    def _opt_on_progress(self, current: int, total: int):
+        self._opt_progress.setValue(current)
+        self._opt_status_lbl.setText(
+            f"Running {current:,} of {total:,}…")
+
+    def _opt_on_done(self, results: list):
+        # Reset UI
+        self._opt_run_btn.setEnabled(True)
+        self._opt_cancel_btn.setEnabled(False)
+        self._opt_progress.setVisible(False)
+
+        if not results:
+            self._opt_status_lbl.setText("Cancelled.")
+            self._opt_results_data = []
+            self._opt_results_sorted_idx = []
+            self._opt_pareto_set = set()
+            self._opt_populate_table()      # keeps Rank 0 if present
+            self._opt_plot_results = []
+            # Reset plot to placeholder
+            fig = self._opt_pareto_fig
+            fig.clear()
+            _ax = fig.add_subplot(111)
+            _ax.set_facecolor("#0d1525")
+            _ax.set_title("Pareto front", color="#aaddff", fontsize=9)
+            _ax.set_xlabel("Bailout gas usage [L]", color="#aaddff", fontsize=8)
+            _ax.set_ylabel("Total deco time [min]", color="#aaddff", fontsize=8)
+            _ax.tick_params(colors="#7799aa", labelsize=7)
+            _ax.text(0.5, 0.5, "Cancelled", ha="center", va="center",
+                     transform=_ax.transAxes, color="#556677", fontsize=9,
+                     style="italic")
+            for sp in _ax.spines.values():
+                sp.set_edgecolor("#334455")
+            fig.tight_layout()
+            self._opt_pareto_canvas.draw()
+            return
+
+        # ── Pareto front (O(n log n)) ─────────────────────────────────────
+        # Standard 2D Pareto sweep: sort x asc then y asc, add only when
+        # tts strictly improves. <= would incorrectly admit dominated points
+        # that share the same tts as an earlier entry with lower bail_L.
+        sorted_idx = sorted(range(len(results)),
+                            key=lambda i: (results[i]["bailout_L"],
+                                           results[i]["tts"]))
+        pareto_set: set = set()
+        min_tts = float("inf")
+        for si in sorted_idx:
+            t = results[si]["tts"]
+            if t < min_tts:
+                min_tts = t
+                pareto_set.add(si)
+
+        # ── Sort by primary → secondary objective ─────────────────────────
+        _key_map = {
+            "Bailout gas usage [L]":  "bailout_L",
+            "Total deco time [min]":  "deco_time",
+            "Total gas usage [L]":    "total_L",
+        }
+        pk = _key_map.get(self._opt_primary_sort.currentText(),   "bailout_L")
+        sk = _key_map.get(self._opt_secondary_sort.currentText(), "deco_time")
+        results_sorted = sorted(range(len(results)),
+                                key=lambda i: (results[i][pk], results[i][sk]))
+
+        # Store state and render (Rank 0 reference row prepended if present)
+        self._opt_results_data       = results
+        self._opt_results_sorted_idx = results_sorted
+        self._opt_pareto_set         = pareto_set
+        self._opt_populate_table()
+
+        n_pareto = len(pareto_set)
+        self._opt_status_lbl.setText(
+            f"Done — {len(results):,} results | top {min(100, len(results))} shown | "
+            f"{n_pareto} Pareto | "
+            f"rejected: {getattr(self,'_opt_last_stats',{}).get('rejected_po2',0):,} PO₂, "
+            f"{getattr(self,'_opt_last_stats',{}).get('rejected_end',0):,} END, "
+            f"{getattr(self,'_opt_last_stats',{}).get('rejected_delta_pn2',0):,} ΔPN₂")
+
+        # ── Draw Pareto scatter plot ───────────────────────────────────────
+        xs = [r["bailout_L"] for r in results]
+        ys = [r["tts"]       for r in results]
+        self._opt_plot_results = results
+        self._opt_plot_xs = xs
+        self._opt_plot_ys = ys
+
+        fig = self._opt_pareto_fig
+        fig.clear()
+        ax = fig.add_subplot(111)
+        ax.set_facecolor("#0d1525")
+        ax.set_title("Pareto front", color="#aaddff", fontsize=9)
+        ax.set_xlabel("Bailout gas usage [L]", color="#aaddff", fontsize=8)
+        ax.set_ylabel("Total deco time [min]",  color="#aaddff", fontsize=8)
+        ax.tick_params(colors="#7799aa", labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#334455")
+
+        # All results — small grey dots
+        ax.scatter(xs, ys, s=15, color="#667788", alpha=0.4, zorder=2)
+
+        # Pareto front — red circles on top
+        xp = [results[i]["bailout_L"] for i in pareto_set]
+        yp = [results[i]["tts"]       for i in pareto_set]
+        ax.scatter(xp, yp, s=50, color="#ff5555", alpha=1.0, zorder=3,
+                   label=f"Pareto ({n_pareto})")
+        ax.legend(fontsize=7, facecolor="#1a1a2e", edgecolor="#334455",
+                  labelcolor="#aaddff")
+
+        fig.tight_layout()
+        self._opt_pareto_canvas.draw()
+
+        print(f"  Simulated: {len(results):,}  |  Pareto: {n_pareto}")
+        print("  Top 5:")
+        for k, ri in enumerate(results_sorted[:5]):
+            r = results[ri]
+            combo = r["combination"]
+            parts = [f"Gas{i} {int(round(o2*100))}/{int(round(he*100))}"
+                     for i,(o2,he) in sorted(combo.items())]
+            p_mark = "✓" if ri in pareto_set else " "
+            print(f"    [{k+1}] {' | '.join(parts)}"
+                  f"  BO={r['bailout_L']:.0f}L"
+                  f"  Deco={r['deco_time']:.0f}min  {p_mark}")
+        print()
+
+    def _opt_populate_table(self):
+        """Render the Top-N table from stored results plus the optional Rank 0
+        reference row.  Row 0 is Rank 0 (when present); optimiser candidates
+        keep their own ranks 1, 2, 3 … in the rows below it.
+        """
+        tbl        = self._opt_result_tbl
+        rank0      = getattr(self, "_opt_rank0", None)
+        results    = getattr(self, "_opt_results_data", None) or []
+        sorted_idx = getattr(self, "_opt_results_sorted_idx", None) or []
+        pareto_set = getattr(self, "_opt_pareto_set", set())
+
+        # Column scheme: from the optimiser's selection, else from Rank 0's
+        if results:
+            sel = getattr(self, "_opt_selected", [])
+        elif rank0:
+            sel = rank0["selected"]
+        else:
+            tbl.setRowCount(0)
+            return
+        n_gas_cols   = min(len(sel), 3)
+        _role_labels = ["Bailout", "Deco 1", "Deco 2"]
+
+        headers = (["Rank"]
+                   + [_role_labels[k] for k in range(n_gas_cols)]
+                   + [f"{_role_labels[k]} [L]" for k in range(n_gas_cols)]
+                   + ["Deco [min]", "Pareto"])
+        tbl.setColumnCount(len(headers))
+        tbl.setHorizontalHeaderLabels(headers)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+        top = sorted_idx[:100]
+        off = 1 if rank0 else 0
+        tbl.clearContents()                 # drop stale cell widgets
+        tbl.setRowCount(off + len(top))
+
+        def _fill(table_row, rank_txt, combo, lpi, deco_time, pareto_txt, is_rank0):
+            cells = [rank_txt]
+            for k in range(n_gas_cols):
+                gi = sel[k]
+                if gi in combo:
+                    o2f, hef = combo[gi]
+                    cells.append(f"{int(round(o2f*100))}/{int(round(hef*100))}")
+                else:
+                    cells.append("—")
+            for k in range(n_gas_cols):
+                gi = sel[k]
+                L  = lpi[gi] if gi < len(lpi) else 0.0
+                cells.append(f"{L:.0f}")
+            cells.append(f"{deco_time:.0f}")
+            cells.append(pareto_txt)
+
+            for col, txt in enumerate(cells):
+                if col == 0:
+                    btn = QPushButton(txt)
+                    btn.setFlat(True)
+                    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    _clr = ("#9a6b00", "#5e4100") if is_rank0 else ("#2a6fd6", "#103e8a")
+                    btn.setStyleSheet(
+                        f"QPushButton{{color:{_clr[0]}; font-weight:bold;"
+                        f" border:none; background:transparent;}}"
+                        f"QPushButton:hover{{color:{_clr[1]};"
+                        f" text-decoration:underline;}}")
+                    btn.clicked.connect(
+                        lambda _c=False, rr=table_row: self._opt_on_rank_clicked(rr))
+                    tbl.setCellWidget(table_row, col, btn)
+                    continue
+                item = QTableWidgetItem(txt)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if is_rank0:
+                    item.setBackground(QColor("#fff3c4"))   # light-yellow ref row
+                elif pareto_txt and col == len(cells) - 1:
+                    item.setForeground(QColor("#44aa44"))
+                tbl.setItem(table_row, col, item)
+
+        if rank0:
+            rr = rank0["result"]
+            _fill(0, "★ 0", rank0["combination"], rr.get("litres_per_idx", []),
+                  rr["deco_time"], "", True)
+
+        for i, ri in enumerate(top):
+            r = results[ri]
+            pareto = "✓" if ri in pareto_set else ""
+            _fill(off + i, str(i + 1), r["combination"],
+                  r.get("litres_per_idx", []), r["deco_time"], pareto, False)
+
+    def _opt_add_current_plan(self):
+        """Add (or refresh) the current main-planner bailout plan as Rank 0.
+
+        Works whether or not an optimisation has been run.  Re-pressing updates
+        Rank 0 with the latest gas mixes from the Bailout Gas tab.
+        """
+        from PyQt6.QtWidgets import QMessageBox
+
+        p = getattr(self, "_opt_cached_params", None)
+        if p is None:
+            QMessageBox.information(self, "Add current plan",
+                "Run a dive plan first so the planner has valid parameters.")
+            return
+
+        try:
+            sac = float(getattr(self, "_sac_le", None).text())
+        except Exception:
+            sac = 20.0
+
+        bottom_d = max((d for d, _ in p["segments"]), default=0.0)
+
+        # Current-plan OC gas list — same rules as _opt_run_pressed: gas 0
+        # (bailout) switches at the bottom, others use their UI switch depth.
+        oc_gases = []
+        skip     = set()
+        for i, row in enumerate(self._gas_rows):
+            if i == 0:
+                sw = bottom_d
+            else:
+                try:
+                    sw = float(row["sw_le"].text())
+                except (ValueError, AttributeError):
+                    sw = 0.0
+                if sw >= 990 or sw <= 0:
+                    skip.add(i)
+            # row["o2"]/["he"] are integer percent → OCGas wants fractions 0–1
+            oc_gases.append(OCGas(o2=row.get("o2", 0.0) / 100.0,
+                                  he=row.get("he", 0.0) / 100.0,
+                                  switch_depth=sw))
+
+        # Active bottles = configured mix (O₂ > 0) with a valid switch depth
+        active = [i for i in range(len(self._gas_rows))
+                  if i not in skip and oc_gases[i].o2 > 0]
+        if not active:
+            QMessageBox.information(self, "Add current plan",
+                "No bailout/deco gases are configured in the Bailout Gas tab.")
+            return
+
+        # combination = current mixes at the active indices.  Against this
+        # oc_gases list it is a no-op swap, so simulate_combo reproduces the
+        # current plan exactly.
+        combo = {i: (oc_gases[i].o2, oc_gases[i].he) for i in active}
+
+        try:
+            result_dict = _OptWorker.build_result(combo, oc_gases, p, sac)
+        except Exception as e:
+            QMessageBox.warning(self, "Add current plan",
+                f"Could not simulate the current plan:\n{e}")
+            return
+
+        self._opt_rank0 = {
+            "combination": combo,
+            "oc_gases":    oc_gases,
+            "selected":    active,
+            "result":      result_dict,
+        }
+        self._opt_populate_table()
+        self._opt_status_lbl.setText("Added current plan as Rank 0  (★).")
+
+    def _opt_on_plot_click(self, event):
+        """Scroll Top-N table to the row nearest the clicked plot point."""
+        if event.inaxes is None:
+            return
+        results = getattr(self, "_opt_plot_results", [])
+        xs      = getattr(self, "_opt_plot_xs", [])
+        ys      = getattr(self, "_opt_plot_ys", [])
+        if not results or event.xdata is None:
+            return
+
+        # Normalise by axis range so neither axis dominates distance
+        x_rng = max(xs) - min(xs) or 1.0
+        y_rng = max(ys) - min(ys) or 1.0
+        best_i, best_d = 0, float("inf")
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            d = ((x - event.xdata) / x_rng) ** 2 + ((y - event.ydata) / y_rng) ** 2
+            if d < best_d:
+                best_d = d; best_i = i
+
+        # Find that result in the top-100 sorted list and select its row.
+        # Offset by 1 when a Rank 0 reference row occupies the first table row.
+        top_idx = getattr(self, "_opt_results_sorted_idx", [])[:100]
+        if best_i in top_idx:
+            off = 1 if getattr(self, "_opt_rank0", None) else 0
+            row = top_idx.index(best_i) + off
+            self._opt_result_tbl.selectRow(row)
+            # Col 0 holds the Rank button (a cell widget, not an item), so
+            # scroll to a real item in the row instead.
+            _it = self._opt_result_tbl.item(row, 1)
+            if _it is not None:
+                self._opt_result_tbl.scrollToItem(_it)
+
     def _rebuild_gas_rows(self, stages: list):
         """Rebuild 4 bailout gas rows, preserving existing sw/drop/role/stage_sel."""
         prev = self._gas_rows[:]
@@ -3171,6 +4281,10 @@ class DivePlannerTab(QWidget):
 
         if self._gas_rows:
             self._gas_rows[0]["sw_le"].setStyleSheet(f"background:{CLR_GREY};")
+
+        # Keep optimizer gas columns in sync
+        if hasattr(self, "_opt_col_a_vl"):
+            self._opt_refresh_gases()
 
     # ── CCR Dive Plan result panel ────────────────────────────────────────────
 
@@ -4422,6 +5536,7 @@ class DivePlannerTab(QWidget):
     def _do_run(self, r: dict):
         # ── Unpack simulation results and parameters ─────────────────────────
         p             = r["params"]
+        self._opt_cached_params = p   # used by optimal-bailout worker
         segments      = p["segments"]
         ccr           = p["ccr"]
         oc_gases      = p["oc_gases"]
