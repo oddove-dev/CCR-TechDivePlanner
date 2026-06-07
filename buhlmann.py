@@ -771,6 +771,16 @@ def _gas_litres_per_idx(
     return litres
 
 
+def mod_switch_depth(o2_frac: float, max_po2: float, bottom_d: float = 0.0) -> float:
+    """MOD: depth [m] where PO2 == max_po2 for an O2 fraction.
+    depth/10+1 convention: PO2 = fO2 * (depth/10 + 1)  →  depth = (max_po2/fO2 - 1)*10.
+    Returns bottom_d for a non-positive O2 fraction.
+    """
+    if o2_frac <= 0:
+        return bottom_d
+    return (max_po2 / o2_frac - 1.0) * 10.0
+
+
 def generate_gas_combinations(
     gas_rows:        List[OCGas],
     selected_indices: List[int],
@@ -778,11 +788,12 @@ def generate_gas_combinations(
     o2_step:         int,
     he_step:         int,
     max_delta_pn2:   float,
-    max_end_m:       float = 999.0,
+    max_ead_m:       float = 999.0,
+    bottom_d:        float = 0.0,
 ) -> tuple:
     """
     Generate all (o2, he) combinations for selected cylinders and filter
-    by PO2 limits, END limit, and ΔPN2 at gas switches.
+    by PO2 limits, EAD limit, and ΔPN2 at gas switches.
 
     Arguments:
         gas_rows         -- all OCGas objects in the dive (fixed switch depths)
@@ -791,9 +802,10 @@ def generate_gas_combinations(
         o2_step          -- O2 grid spacing in percent (e.g. 5)
         he_step          -- He grid spacing in percent (e.g. 5)
         max_delta_pn2    -- maximum allowed PN2 increase at a gas switch [bar]
-        max_end_m        -- maximum Equivalent Narcotic Depth [m] at switch depth
-                           END = (switch_depth + 10) * (1 - fhe) - 10
-                           Default 999 = no END constraint.
+        max_ead_m        -- maximum Equivalent Air Depth [m] at switch depth
+                           EAD = (switch_depth + 10) * fN2 / 0.79 - 10
+                           (only N2 narcotic — modern tek convention)
+                           Default 999 = no EAD constraint.
 
     Returns:
         (valid_combinations, stats)
@@ -804,7 +816,7 @@ def generate_gas_combinations(
         stats -- {
             "total_generated": int,    # cartesian product size (after all pre-filters)
             "rejected_po2": int,       # per-gas pairs removed by PO2 check
-            "rejected_end": int,       # per-gas pairs removed by END check
+            "rejected_ead": int,       # per-gas pairs removed by EAD check
             "rejected_delta_pn2": int, # combinations removed by ΔPN2 check
             "valid": int,
             "limit_exceeded": bool,    # True if valid count exceeded 100 000
@@ -815,7 +827,7 @@ def generate_gas_combinations(
     stats = {
         "total_generated":    0,
         "rejected_po2":       0,
-        "rejected_end":       0,
+        "rejected_ead":       0,
         "rejected_delta_pn2": 0,
         "valid":              0,
         "limit_exceeded":     False,
@@ -863,18 +875,39 @@ def generate_gas_combinations(
 
                 o2_frac = o2_pct / 100.0
                 he_frac = he_pct / 100.0
-                po2     = o2_frac * p_amb
 
+                # Effective switch depth = MOD at this candidate's O2 and the
+                # cylinder's optimiser max-PO2.  The bailout (index 0) is breathed
+                # at the bottom, so its PO2/EAD are evaluated there.
+                if idx == 0:
+                    sw_eff = bottom_d
+                else:
+                    sw_eff = mod_switch_depth(o2_frac, max_po2, bottom_d)
+
+                # PO2 check at sw_eff (depth/10+1 convention, consistent with MOD):
+                # a deco gas sits exactly at max_po2 there; the bailout is checked
+                # at the bottom, which rejects too-rich bailout mixes.
+                po2 = o2_frac * (1.0 + sw_eff / 10.0)
                 if not (min_po2 <= po2 <= max_po2):
                     stats["rejected_po2"] += 1
                     continue
-                # END check: (switch_depth + 10) * (1 - fhe) - 10
-                # O2 and N2 treated equally narcotic (standard tek convention)
-                end_m = (sw_depth + 10.0) * (1.0 - he_frac) - 10.0
-                if end_m > max_end_m:
-                    stats["rejected_end"] += 1
-                    continue
-                candidates.append((o2_frac, he_frac))
+                # EAD check — "helium only when needed for narcosis":
+                # EAD = (sw_eff + 10) * fN2 / 0.79 - 10  (only N2 narcotic).
+                # If the gas already meets the EAD limit with NO helium, helium
+                # buys nothing (it only lengthens deco), so require fHe == 0.
+                # Otherwise apply the normal EAD check (which forces enough He).
+                ead_zero_he = (sw_eff + 10.0) * (1.0 - o2_frac) / 0.79 - 10.0
+                if ead_zero_he <= max_ead_m:
+                    if he_frac > 0:
+                        stats["rejected_ead"] += 1   # unnecessary helium
+                        continue
+                else:
+                    fn2   = 1.0 - o2_frac - he_frac
+                    ead_m = (sw_eff + 10.0) * fn2 / 0.79 - 10.0
+                    if ead_m > max_ead_m:
+                        stats["rejected_ead"] += 1
+                        continue
+                candidates.append((o2_frac, he_frac, sw_eff))
 
         per_gas[idx] = candidates
 
@@ -897,17 +930,20 @@ def generate_gas_combinations(
     }
 
     for combo in _iproduct(*candidate_lists):
-        # Optimised gases for this combination
-        opt_map = {indices_order[k]: combo[k] for k in range(len(indices_order))}
+        # combo[k] = (o2_frac, he_frac, sw_eff) for gas indices_order[k]
+        opt_map = {indices_order[k]: (combo[k][0], combo[k][1])
+                   for k in range(len(indices_order))}     # returned (o2, he)
+        opt_sw  = {indices_order[k]: combo[k][2]
+                   for k in range(len(indices_order))}     # effective switch depth
 
         # Full sorted gas list: (switch_depth, o2_frac, he_frac)
         full: List[tuple] = []
         for i in range(len(gas_rows)):
-            sw = gas_rows[i].switch_depth
             if i in opt_map:
                 o2f, hef = opt_map[i]
+                sw = opt_sw[i]
             else:
-                _, o2f, hef = non_opt[i]
+                sw, o2f, hef = non_opt[i]
             full.append((sw, o2f, hef))
 
         # Sort deepest first
