@@ -22,6 +22,7 @@ For unusually long bailouts, the application supports modelling cylinder drops �
 - CCR dive planning with configurable setpoints (descent, bottom, deco)
 - Bühlmann ZHL-16C decompression with gradient factors (GF Low/High)
 - Bailout OC gas planning with two bailout modes (see below)
+- **Optimal Bailout optimizer** — searches OC gas combinations for the best bailout/deco mixes against your dive, with a Pareto front and multi-core simulation (see below)
 - Tissue saturation charts and heatmaps
 - Gas consumption calculations for both CCR and bailout plans
 - Dive profile visualisation with overlaid CCR and bailout profiles (matplotlib)
@@ -47,6 +48,28 @@ The diver bails out to OC *X* minutes before the planned CCR ascent and immediat
 - Chart: CCR profile stays flat until its ascent time; bailout profile diverges upward *X* minutes earlier
 - Buoyancy snapshot shown at the bailout switch point (same logic as Mode 1)
 - Enable with the **Ascend immediately** checkbox in Settings → Bailout
+
+## Optimal Bailout Optimizer
+
+The **Optimal bailout** tab searches across open-circuit gas combinations to find efficient bailout/deco gas sets for the current dive. Each candidate is run through the same full Bühlmann bailout simulation as the planner, then ranked.
+
+### How it works
+
+- **Per-cylinder modes** — each bailout/deco cylinder can be set to:
+  - **Optimize** — vary its O₂/He across the grid
+  - **Use fixed** — pin it to a specific mix you type (e.g. a candidate you discovered, or a gas not in your planner). Type a mix into an empty slot to add an extra fixed gas.
+  - **Remove** — leave it out of the dive
+  - Defaults follow the dive plan: a cylinder that isn't part of the plan defaults to **Remove**.
+- **Constraints** — configurable O₂/He grid step, Max PO₂ per cylinder, Max EAD (helium-only-when-needed narcosis rule), Max ΔPN₂ (isobaric counterdiffusion at gas switches), and a combination cap.
+- **Auto-fit Min PO₂** — sets each active cylinder's Min PO₂ to the richest mix its grid can reach, so a run is never emptied by a too-high Min.
+- **Objectives & Pareto front** — results are sorted by configurable primary/secondary objectives (surface time, deco time, bailout/total gas usage) with the Pareto-optimal front highlighted on a colour-coded plot (colour = bailout He%).
+- **Multi-core** — large runs are parallelised across CPU cores (`Auto` = all but one); each combination is an independent full deco simulation.
+
+### Comparing candidates
+
+- **★ Rank 0** — your current planner bailout plan is shown as a reference row, recomputed against the current dive on every run (never stale).
+- **📌 Keep** — pin any result row to keep it across runs for side-by-side comparison; kept rows are re-simulated against the current dive so they stay comparable.
+- Click a **Rank** number to open the full bailout plan (stops, runtime, gas, PO₂/PN₂/ΔPN₂, EAD, buoyancy) for that candidate.
 
 ## Requirements
 
