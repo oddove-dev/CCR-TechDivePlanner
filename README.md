@@ -36,14 +36,14 @@ The bailout planner models a parallel worst-case OC scenario alongside the CCR p
 
 ### Mode 1 — Bail out, wait, then ascend (default)
 
-The diver bails out to OC *X* minutes before the planned CCR ascent, spends those *X* minutes at depth on OC gas, then begins the OC ascent at the same time the CCR plan ascends. Total bottom time is unchanged. This models a realistic emergency where the diver needs time to assess the situation and prepare before ascending.
+The diver bails out to OC *X* minutes before the planned CCR ascent, spends those *X* minutes at depth on OC gas, then begins the OC ascent at the same time the CCR plan ascends. Total bottom time is unchanged. Use this mode when you want to start the ascent from the **same point and the same time at depth** as the planned CCR dive — for example to return to a fixed ascent location such as an upline or shotline. Because the diver breathes open circuit at depth for those extra *X* minutes, this mode consumes **more bailout gas** than Mode 2.
 
 - Chart: both profiles flat at bottom depth until CCR ascent time, then diverge
 - Buoyancy snapshot shown at the bailout switch point (before any OC gas consumed)
 
 ### Mode 2 — Bail out and ascend immediately
 
-The diver bails out to OC *X* minutes before the planned CCR ascent and immediately begins ascending — no time spent at depth on OC. The OC ascent starts *X* minutes earlier than the CCR ascent.
+The diver bails out to OC *X* minutes before the planned CCR ascent and immediately begins ascending — no time spent at depth on OC. The OC ascent starts *X* minutes earlier than the CCR ascent. By minimising time at depth on open circuit, this mode consumes **less bailout gas** than Mode 1. It can model a direct **open-water ascent** rather than returning to a fixed upline/shotline, saving further bailout gas.
 
 - Chart: CCR profile stays flat until its ascent time; bailout profile diverges upward *X* minutes earlier
 - Buoyancy snapshot shown at the bailout switch point (same logic as Mode 1)
