@@ -790,6 +790,7 @@ def generate_gas_combinations(
     max_delta_pn2:   float,
     max_ead_m:       float = 999.0,
     bottom_d:        float = 0.0,
+    max_combos:      int   = 100_000,
 ) -> tuple:
     """
     Generate all (o2, he) combinations for selected cylinders and filter
@@ -819,7 +820,7 @@ def generate_gas_combinations(
             "rejected_ead": int,       # per-gas pairs removed by EAD check
             "rejected_delta_pn2": int, # combinations removed by ΔPN2 check
             "valid": int,
-            "limit_exceeded": bool,    # True if valid count exceeded 100 000
+            "limit_exceeded": bool,    # True if valid count exceeded max_combos
         }
     """
     from itertools import product as _iproduct
@@ -888,7 +889,10 @@ def generate_gas_combinations(
                 # a deco gas sits exactly at max_po2 there; the bailout is checked
                 # at the bottom, which rejects too-rich bailout mixes.
                 po2 = o2_frac * (1.0 + sw_eff / 10.0)
-                if not (min_po2 <= po2 <= max_po2):
+                # 1e-9 tolerance: a deco gas sits at exactly max_po2 at its MOD,
+                # so Min == Max (e.g. after Auto-fit) must not self-exclude on
+                # floating-point rounding.
+                if not (min_po2 - 1e-9 <= po2 <= max_po2 + 1e-9):
                     stats["rejected_po2"] += 1
                     continue
                 # EAD check — "helium only when needed for narcosis":
@@ -970,7 +974,7 @@ def generate_gas_combinations(
         else:
             valid_combinations.append(opt_map)
             stats["valid"] += 1
-            if stats["valid"] > 100_000:
+            if stats["valid"] > max_combos:
                 stats["limit_exceeded"] = True
                 return [], stats
 

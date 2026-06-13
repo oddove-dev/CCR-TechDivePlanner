@@ -2020,9 +2020,18 @@ class MainWindow(QMainWindow):
 
         # ── Optimal bailout tab (top-level, full window) ──────────────────────
         opt_bail_w = dp_tab._build_optimal_bailout()
-        self._tabs.addTab(opt_bail_w, "  Optimal bailout  ")
+        self._opt_bail_index = self._tabs.addTab(opt_bail_w, "  Optimal bailout  ")
+        self._dp_tab = dp_tab
+
+        # When the Optimal bailout tab is opened, re-sync its cylinder defaults
+        # to the current dive plan (only if the plan's gas set changed).
+        self._tabs.currentChanged.connect(self._on_tab_changed)
 
         self._tabs.setCurrentIndex(3)   # show Databases first
+
+    def _on_tab_changed(self, index):
+        if index == getattr(self, "_opt_bail_index", -1):
+            self._dp_tab._opt_sync_to_plan()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2038,4 +2047,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Required before any multiprocessing use so the frozen (PyInstaller) .exe
+    # does not relaunch the whole GUI in each optimiser worker process.
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()
