@@ -28,7 +28,7 @@ For unusually long bailouts, the application supports modelling cylinder drops �
 - Dive profile visualisation with overlaid CCR and bailout profiles (matplotlib)
 - Background simulation — UI stays responsive during profile switches
 - Save/load multiple dive profiles
-- Gas calculation tab *(work in progress — not yet functional)*
+- **Gas Planner** with two tools: a **Gas Blending** calculator (real-gas GERG-2008 fill sequences, best-mix-for-depth, Z-factor chart) and an **ICD Analysis** tool (isobaric counterdiffusion — ΔPN₂ across gas switches vs depth)
 
 ## Bailout Modes
 
@@ -71,17 +71,36 @@ The **Optimal bailout** tab searches across open-circuit gas combinations to fin
 - **📌 Keep** — pin any result row to keep it across runs for side-by-side comparison; kept rows are re-simulated against the current dive so they stay comparable.
 - Click a **Rank** number to open the full bailout plan (stops, runtime, gas, PO₂/PN₂/ΔPN₂, EAD, buoyancy) for that candidate.
 
+## Gas Planner
+
+The Gas Planner has two tools, each on its own sub-tab.
+
+### Gas Blending
+
+A real-gas partial-pressure blend calculator running on **GERG-2008** (CoolProp HEOS):
+
+- Computes the **fill sequence** (He → O₂ → top gas) to reach a target O₂/He at a target pressure, from an empty or partly-filled cylinder, with optional drain.
+- Top gas selectable as air, O₂, or a custom mix.
+- **Best mix for depth** — derive the optimal O₂/He for a depth from ppO₂ and EAD limits and push it into the target.
+- Gas **limits** panel for the target mix: MOD @1.4 / @1.6, ppO₂ at depth, EAD at depth.
+- **Z-factor vs pressure** chart for the blended mix.
+
+### ICD Analysis
+
+Isobaric counterdiffusion analysis across up to 4 gases / 3 switches — the ΔPN₂ at each gas switch versus depth, with colour-coded safe/caution/over-limit cells and a ΔPN₂-vs-depth chart.
+
 ## Requirements
 
 - Python 3.10+
 - PyQt6
 - matplotlib
 - numpy
+- CoolProp (for the Gas Blending tool — GERG-2008 real-gas EOS)
 
 ## Install
 
 ```bash
-pip install PyQt6 matplotlib numpy
+pip install PyQt6 matplotlib numpy CoolProp
 ```
 
 ## Run
