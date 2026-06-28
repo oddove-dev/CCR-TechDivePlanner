@@ -21,6 +21,7 @@ from PyQt6.QtGui import QColor, QFont, QPalette
 
 from dive_planner_tab import DivePlannerTab
 from gas_calc_tab_qt import GasCalcTabQt
+from gas_blending_tab_qt import GasBlendingTabQt
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DB_PATH = Path(__file__).parent / "cylindercalc_db.json"
@@ -2008,8 +2009,19 @@ class MainWindow(QMainWindow):
         dp_tab.load_deco_profiles(profiles0)
 
         # ── Gas Planner ───────────────────────────────────────────────────────
+        # Inner tab widget filling the whole Gas Planner area: Gas Blending
+        # first, then the existing ICD Analysis content (unchanged).
         gc_tab = GasCalcTabQt(db=self._db, save_fn=lambda: save_db(self._db))
-        self._tabs.addTab(gc_tab, "  Gas Planner  ")
+
+        gas_planner_w = QWidget()
+        gas_planner_lay = QVBoxLayout(gas_planner_w)
+        gas_planner_lay.setContentsMargins(0, 0, 0, 0)
+        gas_planner_inner = QTabWidget()
+        gas_planner_inner.addTab(GasBlendingTabQt(), "Gas Blending")
+        gas_planner_inner.addTab(gc_tab, "ICD Analysis")
+
+        gas_planner_lay.addWidget(gas_planner_inner)
+        self._tabs.addTab(gas_planner_w, "  Gas Planner  ")
 
         # ── Databases tab ─────────────────────────────────────────────────────
         scroll = QScrollArea()
@@ -2018,16 +2030,19 @@ class MainWindow(QMainWindow):
         scroll.setWidget(db_tab)
         self._tabs.addTab(scroll, "  Databases  ")
 
-        # ── Optimal bailout tab (top-level, full window) ──────────────────────
+        # ── Optimal bailout tab ───────────────────────────────────────────────
+        # Built last (needs dp_tab ready) but placed between Dive Planner and
+        # Gas Planner via insertTab.
         opt_bail_w = dp_tab._build_optimal_bailout()
-        self._opt_bail_index = self._tabs.addTab(opt_bail_w, "  Optimal bailout  ")
+        self._opt_bail_index = self._tabs.insertTab(2, opt_bail_w,
+                                                    "  Optimal bailout  ")
         self._dp_tab = dp_tab
 
         # When the Optimal bailout tab is opened, re-sync its cylinder defaults
         # to the current dive plan (only if the plan's gas set changed).
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
-        self._tabs.setCurrentIndex(3)   # show Databases first
+        self._tabs.setCurrentWidget(scroll)   # show Databases first
 
     def _on_tab_changed(self, index):
         if index == getattr(self, "_opt_bail_index", -1):
